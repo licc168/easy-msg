@@ -594,6 +594,40 @@ function domMessages() {
   return messages.slice(-40);
 }
 
+function fireClick(el) {
+  const view = el.ownerDocument && el.ownerDocument.defaultView;
+  const rect = el.getBoundingClientRect();
+  const init = {
+    bubbles: true,
+    cancelable: true,
+    view: view,
+    clientX: rect.left + Math.max(rect.width, 8) / 2,
+    clientY: rect.top + Math.max(rect.height, 8) / 2,
+  };
+  try {
+    el.dispatchEvent(new PointerEvent("pointerdown", init));
+    el.dispatchEvent(new MouseEvent("mousedown", init));
+    el.dispatchEvent(new PointerEvent("pointerup", init));
+    el.dispatchEvent(new MouseEvent("mouseup", init));
+  } catch (error) {
+    // Older documents may not expose PointerEvent.
+  }
+  el.click();
+}
+
+function openDouyinConversation(title) {
+  if (!title || location.hostname.indexOf("douyin") < 0) return false;
+  const rows = queryAll("[class*='conversationConversationItemwrapper']").filter((el) => {
+    const name = el.querySelector("[class*='conversationConversationItemtitle']");
+    const label = name ? (name.innerText || "").replace(/\s+/g, " ").trim() : "";
+    return label === title;
+  });
+  const row = rows.sort((a, b) => a.getBoundingClientRect().width * a.getBoundingClientRect().height - b.getBoundingClientRect().width * b.getBoundingClientRect().height)[0];
+  if (!row) return false;
+  fireClick(row);
+  return true;
+}
+
 function openConversation(id, title) {
   for (const element of queryAll("[data-easy-id]")) {
     if (element.getAttribute("data-easy-id") === id) {
@@ -622,64 +656,272 @@ function openConversation(id, title) {
   return false;
 }
 
-function findEditor() {
+function editorProbe() {
+  const frames = [];
+  for (const frame of document.querySelectorAll("iframe")) {
+    let access = "ok";
+    let href = "";
+    try {
+      href = frame.contentDocument && frame.contentDocument.location ? frame.contentDocument.location.href : "";
+    } catch (error) {
+      access = "blocked";
+    }
+    const rect = frame.getBoundingClientRect();
+    frames.push({
+      src: String(frame.src || "").slice(0, 160),
+      access: access,
+      href: String(href || "").slice(0, 160),
+      w: Math.round(rect.width),
+      h: Math.round(rect.height),
+    });
+  }
+  const interesting = [];
+  const seen = new Set();
+  const selectors = ["textarea", "[contenteditable]", "[role='textbox']", "[data-placeholder]", "[class*='input']", "[class*='Input']", "[class*='editor']", "[class*='Editor']", "[class*='ace-line']"];
+  for (const doc of allDocs()) {
+    for (const selector of selectors) {
+      let nodes = [];
+      try {
+        nodes = doc.querySelectorAll(selector);
+      } catch (error) {
+        continue;
+      }
+      for (const el of nodes) {
+        if (seen.has(el) || interesting.length >= 30) continue;
+        const className = String(el.className || "");
+        const placeholder = el.getAttribute("data-placeholder") || el.getAttribute("placeholder") || el.getAttribute("aria-label") || "";
+        if (!/input|editor|textarea|ace|kit|text|placeholder|send|msg/i.test(className + placeholder) && el.tagName !== "TEXTAREA" && !el.isContentEditable) continue;
+        seen.add(el);
+        const rect = el.getBoundingClientRect();
+        interesting.push({
+          tag: el.tagName,
+          className: className.slice(0, 90),
+          placeholder: String(placeholder).slice(0, 40),
+          editable: Boolean(el.isContentEditable),
+          w: Math.round(rect.width),
+          h: Math.round(rect.height),
+        });
+      }
+    }
+  }
+  const classes = [];
+  const seenClass = new Set();
+  for (const el of document.querySelectorAll("[class]")) {
+    const name = String(el.className || "");
+    if (!/conversation|message|chat|inputArea|editor|MsgInput|ace-line/i.test(name)) continue;
+    const key = name.slice(0, 80);
+    if (seenClass.has(key) || classes.length >= 40) continue;
+    seenClass.add(key);
+    const rect = el.getBoundingClientRect();
+    classes.push({ className: key, w: Math.round(rect.width), h: Math.round(rect.height) });
+  }
+  return {
+    url: location.href,
+    title: document.title,
+    innerWidth: window.innerWidth,
+    innerHeight: window.innerHeight,
+    visibility: document.visibilityState,
+    frames: frames.slice(0, 8),
+    interesting: interesting,
+    classes: classes,
+    titles: [...document.querySelectorAll("[class*='conversationConversationItemtitle']")].slice(0, 8).map((el) => (el.innerText || "").trim()),
+  };
+}
+
+function focusComposer() {
+  const hints = ["\u53d1\u9001\u6d88\u606f", "\u8f93\u5165\u6d88\u606f", "\u8bf4\u70b9\u4ec0\u4e48", "\u53d1\u6d88\u606f", "\u6309\u56de\u8f66\u53d1\u9001"];
+  const nodes = queryAll("div,span,p,textarea,pre,label").filter((el) => {
+    if (!visible(el)) return false;
+    const text = ((el.innerText || "") + " " + (el.getAttribute("placeholder") || "") + " " + (el.getAttribute("aria-label") || "")).replace(/\s+/g, " ").trim();
+    if (!text || text.length > 24) return false;
+    return hints.some((hint) => text.indexOf(hint) >= 0);
+  });
+  nodes.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+  if (!nodes[0]) return false;
+  nodes[0].click();
+  return true;
+}
+
+function editorRoots() {
+  const roots = [];
+  const visit = (root) => {
+    if (!root || roots.indexOf(root) >= 0) return;
+    roots.push(root);
+    let nodes = [];
+    try {
+      nodes = root.querySelectorAll ? root.querySelectorAll("*") : [];
+    } catch (error) {
+      nodes = [];
+    }
+    for (const el of nodes) {
+      if (el.shadowRoot) visit(el.shadowRoot);
+    }
+  };
+  for (const doc of allDocs()) visit(doc);
+  return roots;
+}
+
+function editorHint(el) {
+  const bits = [
+    el.getAttribute("placeholder") || "",
+    el.getAttribute("aria-label") || "",
+    el.getAttribute("data-placeholder") || "",
+    String(el.className || ""),
+  ];
+  let parent = el.parentElement;
+  for (let depth = 0; parent && depth < 4; depth += 1) {
+    bits.push(String(parent.className || ""));
+    parent = parent.parentElement;
+  }
+  return bits.join(" ");
+}
+
+function collectEditors() {
   const selectors = [
     ".xhs-im-input-bar-editor",
     "[data-contents='true']",
-    ".DraftEditor-editor [contenteditable='true']",
-    ".DraftEditor-root [contenteditable='true']",
+    ".public-DraftEditor-content",
+    "[data-slate-editor='true']",
+    "[contenteditable]",
+    "[role='textbox']",
+    "[class*='messageEditorinputArea']",
+    "[class*='inputArea']",
+    "[class*='editor-kit-container']",
+    "[class*='ace-line']",
+    "[class*='imChatEditor']",
+    "[class*='MsgInput']",
     "textarea",
-    "[contenteditable='true']",
+    "[class*='chat-input'] [contenteditable]",
+    "[class*='ChatInput'] [contenteditable]",
+    "[class*='im-richtext']",
+    "[class*='editor-kit']",
+    "[class*='DraftEditor']",
   ];
-  for (const selector of selectors) {
-    const found = queryAll(selector).filter(visible);
-    if (!found.length) continue;
-    found.sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width);
-    return found[0];
+  const seen = new Set();
+  const found = [];
+  for (const root of editorRoots()) {
+    for (const selector of selectors) {
+      let nodes = [];
+      try {
+        nodes = root.querySelectorAll(selector);
+      } catch (error) {
+        continue;
+      }
+      for (const el of nodes) {
+        if (seen.has(el)) continue;
+        const rect = el.getBoundingClientRect();
+        const hint = editorHint(el);
+        const named = /messageEditor|inputArea|editor-kit|ace-line|imChatEditor|MsgInput|xhs-im-input/i.test(hint);
+        if (!named && (rect.width < 48 || rect.height < 10)) continue;
+        const editable = el.isContentEditable || el.tagName === "TEXTAREA" || el.tagName === "INPUT" || el.getAttribute("role") === "textbox";
+        if (!editable && !/input|editor|composer|richtext|draft|textbox/i.test(hint)) continue;
+        if (/search|\u641c\u7d22/i.test(hint) && !/\u53d1\u9001|\u6d88\u606f|editor|composer/i.test(hint)) continue;
+        seen.add(el);
+        found.push(el);
+      }
+    }
   }
-  return null;
+  return found;
+}
+
+function editorScore(el) {
+  const rect = el.getBoundingClientRect();
+  const hint = editorHint(el);
+  const view = el.ownerDocument && el.ownerDocument.defaultView;
+  let score = rect.width * Math.min(rect.height, 120);
+  if (/messageEditorinputArea|inputArea|ace-line/i.test(hint)) score += 5000000;
+  if (/input|editor|composer|richtext|draft|textbox|chat-input|msg-input/i.test(hint)) score += 1000000;
+  if (/\u53d1\u9001|\u6d88\u606f|\u8bf4\u70b9/.test(hint)) score += 800000;
+  if (el.getAttribute("role") === "textbox" || el.isContentEditable) score += 200000;
+  if (view && rect.top > view.innerHeight * 0.4) score += 400000;
+  if (visible(el)) score += 100000;
+  return score;
+}
+
+function findEditor() {
+  let found = collectEditors();
+  if (!found.length && focusComposer()) found = collectEditors();
+  if (!found.length) return null;
+  found.sort((a, b) => editorScore(b) - editorScore(a));
+  return found[0];
 }
 
 function editorValue(editor) {
-  return String(editor.value || editor.innerText || "");
+  return String(editor.value || editor.innerText || editor.textContent || "");
 }
 
-function insertText(text) {
-  const editor = findEditor();
-  if (!editor || !text) return { filled: false };
+function placeCaret(editor) {
+  const doc = editor.ownerDocument;
   editor.focus();
+  if (editor.tagName === "TEXTAREA" || editor.tagName === "INPUT") {
+    const end = String(editor.value || "").length;
+    try {
+      editor.setSelectionRange(end, end);
+    } catch (error) {
+      return;
+    }
+    return;
+  }
+  const selection = doc.getSelection && doc.getSelection();
+  if (!selection) return;
+  const range = doc.createRange();
+  range.selectNodeContents(editor);
+  range.collapse(false);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+function writeEditor(editor, text) {
+  placeCaret(editor);
   const tag = editor.tagName;
   if (tag === "TEXTAREA" || tag === "INPUT") {
     const proto = tag === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const desc = Object.getOwnPropertyDescriptor(proto, "value");
-    if (!desc || !desc.set) return { filled: false };
-    desc.set.call(editor, text);
+    const next = editor.value ? editor.value + text : text;
+    if (desc && desc.set) desc.set.call(editor, next);
+    else editor.value = next;
     editor.dispatchEvent(new Event("input", { bubbles: true }));
     editor.dispatchEvent(new Event("change", { bubbles: true }));
-    return { filled: editor.value.includes(text), via: "input" };
+    return editor.value.indexOf(text) >= 0;
   }
   try {
-    const data = new DataTransfer();
-    data.setData("text/plain", text);
-    editor.dispatchEvent(new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }));
+    editor.ownerDocument.execCommand("insertText", false, text);
   } catch (error) {
-    return { filled: false, via: "draft" };
+    // Some editors reject the command until the caret is placed again.
   }
-  return { filled: editorValue(editor).includes(text), via: "draft" };
+  if (editorValue(editor).indexOf(text) < 0) {
+    try {
+      const data = new DataTransfer();
+      data.setData("text/plain", text);
+      editor.dispatchEvent(new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }));
+    } catch (error) {
+      // Ignore synthetic paste failures.
+    }
+  }
+  if (editorValue(editor).indexOf(text) < 0) {
+    editor.textContent = (editor.textContent || "") + text;
+    editor.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
+  }
+  return editorValue(editor).indexOf(text) >= 0;
+}
+
+function insertText(text) {
+  let editor = findEditor();
+  if (!editor && focusComposer()) editor = findEditor();
+  if (!editor || !text) return { filled: false, found: Boolean(editor) };
+  return { filled: writeEditor(editor, text), found: true, via: editor.className || editor.tagName };
 }
 
 function insertCommand(text) {
   const editor = findEditor();
-  if (!editor || !text) return { filled: false };
-  editor.focus();
-  const ok = editor.ownerDocument.execCommand("insertText", false, text);
-  return { filled: Boolean(ok) || editorValue(editor).includes(text), via: "command" };
+  if (!editor || !text) return { filled: false, found: Boolean(editor) };
+  return { filled: writeEditor(editor, text), found: true, via: "command" };
 }
 
 function editorFilled(text) {
   const editor = findEditor();
-  if (!editor) return { filled: false };
-  return { filled: editorValue(editor).includes(text) };
+  if (!editor) return { filled: false, found: false };
+  return { filled: editorValue(editor).indexOf(text) >= 0, found: true };
 }
 
 function fileFromPayload(payload) {
@@ -1107,10 +1349,35 @@ function run(action) {
     }
     return { conversations: conversations.map(publicConversation), nudged, page: pageInfo() };
   }
+  if (action.type === "douyin-row") {
+    const title = String(action.title || "");
+    const rows = queryAll("[class*='conversationConversationItemwrapper']").filter((el) => {
+      const name = el.querySelector("[class*='conversationConversationItemtitle']");
+      const label = name ? (name.innerText || "").replace(/\s+/g, " ").trim() : "";
+      return label === title;
+    });
+    const row = rows[0];
+    if (!row) return { found: false };
+    const rect = row.getBoundingClientRect();
+    return { found: true, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }
+  if (action.type === "editor-probe") return editorProbe();
+  if (action.type === "editor-ready") {
+    const editor = findEditor();
+    const rect = editor ? editor.getBoundingClientRect() : null;
+    return {
+      found: Boolean(editor),
+      className: editor ? String(editor.className || "").slice(0, 80) : "",
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      width: rect ? Math.round(rect.width) : 0,
+      height: rect ? Math.round(rect.height) : 0,
+    };
+  }
   if (action.type === "xhs-probe") return xhsProbe();
   if (action.type === "open") {
     const title = String(action.title || "");
-    const opened = openXhsConversation(title) || openConversation(String(action.id || ""), title);
+    const opened = openXhsConversation(title) || openDouyinConversation(title) || openConversation(String(action.id || ""), title);
     return { opened: opened, page: pageInfo() };
   }
   if (action.type === "scroll-end") return scrollThreadToEnd();

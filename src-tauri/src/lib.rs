@@ -266,6 +266,98 @@ fn background_window(app: &AppHandle, label: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn os_click(x: i32, y: i32) {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetCursorPos(point: *mut OsPoint) -> i32;
+        fn SetCursorPos(x: i32, y: i32) -> i32;
+        fn mouse_event(flags: u32, dx: u32, dy: u32, data: u32, extra: usize);
+    }
+    #[repr(C)]
+    struct OsPoint {
+        x: i32,
+        y: i32,
+    }
+    unsafe {
+        let mut old = OsPoint { x: 0, y: 0 };
+        GetCursorPos(&mut old);
+        SetCursorPos(x, y);
+        mouse_event(0x0002, 0, 0, 0, 0);
+        mouse_event(0x0004, 0, 0, 0, 0);
+        SetCursorPos(old.x, old.y);
+    }
+}
+
+fn screen_css_point(app: &AppHandle, label: &str, x: f64, y: f64) -> Result<(i32, i32), String> {
+    let label = label.to_string();
+    let app_for_task = app.clone();
+    on_main(app, move || {
+        let Some(window) = app_for_task.get_webview_window(&label) else {
+            return Err("\u{627e}\u{4e0d}\u{5230}\u{7a97}\u{53e3}".into());
+        };
+        let _ = window.set_focusable(true);
+        let _ = window.set_focus();
+        let origin = window.inner_position().map_err(|err| err.to_string())?;
+        let scale = window.scale_factor().map_err(|err| err.to_string())?;
+        Ok((
+            origin.x + (x * scale).round() as i32,
+            origin.y + (y * scale).round() as i32,
+        ))
+    })?
+}
+
+async fn trusted_douyin_open(app: &AppHandle, window: &WebviewWindow, title: &str) -> Result<bool, String> {
+    wake_for_layout(app, window.label())?;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let point = eval_action(
+        app,
+        window.clone(),
+        json!({ "type": "douyin-row", "title": title }),
+    )
+    .await
+    .unwrap_or(json!({}));
+    if let Ok(body) = serde_json::to_string(&point) {
+        let _ = std::fs::write(r"C:\Users\YCSK-039\Documents\ChatGPT\easy-msg\click-debug.json", body);
+    }
+    if !bool_field(&point, "found") {
+        return Ok(false);
+    }
+    let x = point.get("x").and_then(|item| item.as_f64()).unwrap_or(0.0);
+    let y = point.get("y").and_then(|item| item.as_f64()).unwrap_or(0.0);
+    let (screen_x, screen_y) = screen_css_point(app, window.label(), x, y)?;
+    let _ = std::fs::write(
+        r"C:\Users\YCSK-039\Documents\ChatGPT\easy-msg\click-debug.json",
+        format!("{{\"css\":[{x},{y}],\"screen\":[{screen_x},{screen_y}],\"title\":{title:?}}}"),
+    );
+    os_click(screen_x, screen_y);
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    Ok(true)
+}
+
+fn wake_for_layout(app: &AppHandle, label: &str) -> Result<(), String> {
+    let label = label.to_string();
+    let app_for_task = app.clone();
+    on_main(app, move || {
+        let Some(window) = app_for_task.get_webview_window(&label) else {
+            return Ok(());
+        };
+        let main = app_for_task.get_webview_window("main");
+        let (x, y) = main
+            .as_ref()
+            .and_then(|item| item.outer_position().ok())
+            .map(|pos| (pos.x, pos.y))
+            .unwrap_or((80, 80));
+        let _ = window.set_focusable(false);
+        let _ = window.unminimize();
+        let _ = window.set_size(tauri::LogicalSize::new(1100.0, 780.0));
+        let _ = window.set_position(tauri::PhysicalPosition::new(x + 28, y + 28));
+        let _ = window.show();
+        let _ = window.set_focusable(true);
+        let _ = window.set_focus();
+        Ok(())
+    })?
+}
+
 fn park_window(app: &AppHandle, window: &WebviewWindow) {
     set_background(app, window.label(), true);
     let _ = window.set_focusable(false);
@@ -335,18 +427,26 @@ fn ensure_window(
     })?
 }
 
-fn script_for(action: &Value) -> String {
-    let action_json = serde_json::to_string(action).unwrap_or_else(|_| "null".into());
-    let mut script = String::from("(function(){try{\n");
-    script.push_str(BRIDGE);
-    script.push_str("\nreturn JSON.stringify({ok:true,value:run(");
-    script.push_str(&action_json);
-    script.push_str(")});}catch(error){return JSON.stringify({ok:false,error:String(error&&(error.stack||error.message)||error)});}})()");
-    script
+fn action_json(action: &Value) -> String {
+    serde_json::to_string(action).unwrap_or_else(|_| "null".into())
 }
 
-async fn eval_action_once(app: &AppHandle, window: WebviewWindow, action: Value) -> Result<Value, String> {
-    let script = script_for(&action);
+fn script_for(action: &Value) -> String {
+    format!(
+        "(function(){{try{{window.__easyRev=9;window.__easyRun=(function(){{\n{}\nreturn run;}})();return JSON.stringify({{ok:true,value:window.__easyRun({})}});}}catch(error){{return JSON.stringify({{ok:false,error:String(error&&(error.stack||error.message)||error)}});}}}})()",
+        BRIDGE,
+        action_json(action)
+    )
+}
+
+fn quick_script(action: &Value) -> String {
+    format!(
+        "(function(){{try{{if(typeof window.__easyRun!==\"function\"||window.__easyRev!==9)return JSON.stringify({{ok:false,error:\"missing-bridge\"}});return JSON.stringify({{ok:true,value:window.__easyRun({})}});}}catch(error){{return JSON.stringify({{ok:false,error:String(error&&(error.message)||error)}});}}}})()",
+        action_json(action)
+    )
+}
+
+async fn eval_raw(app: &AppHandle, window: WebviewWindow, script: String) -> Result<Value, String> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<String, String>>(1);
     let callback_tx = tx.clone();
     app.run_on_main_thread(move || {
@@ -363,6 +463,14 @@ async fn eval_action_once(app: &AppHandle, window: WebviewWindow, action: Value)
         .map_err(|_| "\u{9875}\u{9762}\u{811a}\u{672c}\u{8d85}\u{65f6}".to_string())?
         .ok_or_else(|| "\u{9875}\u{9762}\u{811a}\u{672c}\u{6ca1}\u{6709}\u{8fd4}\u{56de}".to_string())?;
     parse_eval(&raw?)
+}
+
+async fn eval_action_once(app: &AppHandle, window: WebviewWindow, action: Value) -> Result<Value, String> {
+    match eval_raw(app, window.clone(), quick_script(&action)).await {
+        Ok(value) => Ok(value),
+        Err(err) if err == "missing-bridge" => eval_raw(app, window, script_for(&action)).await,
+        Err(err) => Err(err),
+    }
 }
 
 async fn eval_action(app: &AppHandle, window: WebviewWindow, action: Value) -> Result<Value, String> {
@@ -398,7 +506,7 @@ fn parse_eval(raw: &str) -> Result<Value, String> {
 }
 
 async fn wait_for_platform(window: &WebviewWindow, platform: Platform) -> String {
-    for _ in 0..40 {
+    for attempt in 0..40 {
         if let Ok(url) = window.url() {
             let host = url.host_str().unwrap_or("");
             if platform
@@ -406,7 +514,9 @@ async fn wait_for_platform(window: &WebviewWindow, platform: Platform) -> String
                 .iter()
                 .any(|item| host == *item || host.ends_with(&format!(".{item}")))
             {
-                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                }
                 return url.to_string();
             }
         }
@@ -812,6 +922,18 @@ async fn sync_platform(
         }
         Ok(conversations)
     })?;
+    if matches!(platform, Platform::Douyin) {
+        if let Some(title) = conversations.first().map(|item| item.title.clone()) {
+            let _ = trusted_douyin_open(&app, &window, &title).await;
+        }
+        let _ = capture_editor_probe(&app, &window).await;
+        let window_for_park = window.clone();
+        let app_for_park = app.clone();
+        let _ = on_main(&app, move || {
+            park_window(&app_for_park, &window_for_park);
+            Ok::<(), String>(())
+        });
+    }
     #[cfg(debug_assertions)]
     eprintln!(
         "sync {} count={} url={}",
@@ -841,7 +963,6 @@ async fn load_thread(
     let _guard = lock.lock().await;
     let window = ensure_window(&app, platform, "messages", false, false, false)?;
     wait_for_platform(&window, platform).await;
-    let _ = sync_once(&app, &window, true).await;
     let opened = eval_action(
         &app,
         window.clone(),
@@ -849,9 +970,14 @@ async fn load_thread(
     )
     .await?;
     let _ = eval_action(&app, window.clone(), json!({ "type": "scroll-end" })).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let report = eval_action(&app, window, json!({ "type": "messages" })).await?;
-    let messages = messages_from(&report);
+    tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+    let mut report = eval_action(&app, window.clone(), json!({ "type": "messages" })).await?;
+    let mut messages = messages_from(&report);
+    if messages.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(320)).await;
+        report = eval_action(&app, window.clone(), json!({ "type": "messages" })).await?;
+        messages = messages_from(&report);
+    }
     let warning = if bool_field(&opened, "opened") || !messages.is_empty() {
         String::new()
     } else {
@@ -893,6 +1019,16 @@ fn outgoing_image(image: &OutgoingImage) -> Result<(), String> {
     Ok(())
 }
 
+async fn capture_editor_probe(app: &AppHandle, window: &WebviewWindow) -> Value {
+    let probe = eval_action(app, window.clone(), json!({ "type": "editor-probe" }))
+        .await
+        .unwrap_or(json!({ "error": "probe-failed" }));
+    if let Ok(body) = serde_json::to_string_pretty(&probe) {
+        let _ = std::fs::write(r"C:\Users\YCSK-039\Documents\ChatGPT\easy-msg\editor-probe.json", &body);
+    }
+    probe
+}
+
 #[tauri::command]
 async fn send_message(
     app: AppHandle,
@@ -928,8 +1064,33 @@ async fn send_message(
     if !bool_field(&opened, "opened") {
         return Err("\u{8fd8}\u{6ca1}\u{8bfb}\u{5230}\u{8fd9}\u{6761}\u{4f1a}\u{8bdd}".into());
     }
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    if matches!(platform, Platform::Xhs) {
+    let mut editor_ready = false;
+    for _ in 0..4 {
+        let ready = eval_action(&app, window.clone(), json!({ "type": "editor-ready" }))
+            .await
+            .unwrap_or(json!({}));
+        if bool_field(&ready, "found") {
+            editor_ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    if !editor_ready && matches!(platform, Platform::Douyin) {
+        let _ = trusted_douyin_open(&app, &window, &title).await;
+    } else if !editor_ready {
+        wake_for_layout(&app, platform.as_str())?;
+        let _ = eval_action(
+            &app,
+            window.clone(),
+            json!({ "type": "open", "id": id, "title": title }),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    if image.is_some() {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    if image.is_some() && matches!(platform, Platform::Xhs) {
         for _ in 0..8 {
             let ready = eval_action(&app, window.clone(), json!({ "type": "xhs-probe" })).await.unwrap_or(json!({}));
             let editor = ready.get("editor").and_then(|item| item.as_u64()).unwrap_or(0);
@@ -944,27 +1105,14 @@ async fn send_message(
     let mut image_sent = false;
     let mut warning = String::new();
     if !text.is_empty() {
-        let _ = eval_action(
+        let mut filled = eval_action(
             &app,
             window.clone(),
             json!({ "type": "insert", "text": text }),
         )
         .await?;
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let mut filled = eval_action(
-            &app,
-            window.clone(),
-            json!({ "type": "editor-filled", "text": text }),
-        )
-        .await?;
         if !bool_field(&filled, "filled") {
-            let _ = eval_action(
-                &app,
-                window.clone(),
-                json!({ "type": "insert-command", "text": text }),
-            )
-            .await?;
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(320)).await;
             filled = eval_action(
                 &app,
                 window.clone(),
@@ -973,14 +1121,39 @@ async fn send_message(
             .await?;
         }
         if !bool_field(&filled, "filled") {
-            return Err("\u{627e}\u{4e0d}\u{5230}\u{8f93}\u{5165}\u{6846}".into());
+            let _ = eval_action(
+                &app,
+                window.clone(),
+                json!({ "type": "insert-command", "text": text }),
+            )
+            .await?;
+            filled = eval_action(
+                &app,
+                window.clone(),
+                json!({ "type": "editor-filled", "text": text }),
+            )
+            .await?;
+        }
+        if !bool_field(&filled, "filled") {
+            let probe = capture_editor_probe(&app, &window).await;
+            let width = probe.get("innerWidth").and_then(|item| item.as_u64()).unwrap_or(0);
+            let height = probe.get("innerHeight").and_then(|item| item.as_u64()).unwrap_or(0);
+            let count = probe
+                .get("interesting")
+                .and_then(|item| item.as_array())
+                .map(|item| item.len())
+                .unwrap_or(0);
+            return Err(format!("\u{627e}\u{4e0d}\u{5230}\u{8f93}\u{5165}\u{6846} {width}x{height} {count}"));
         }
         let sent = eval_action(&app, window.clone(), json!({ "type": "click-send" })).await?;
         text_sent = bool_field(&sent, "clicked") || bool_field(&sent, "usedEnter");
         if !text_sent {
             warning = "\u{6ca1}\u{6709}\u{70b9}\u{5230}\u{53d1}\u{9001}".into();
+        } else if image.is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(160)).await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     }
     if warning.is_empty() {
         if let Some(image) = image {

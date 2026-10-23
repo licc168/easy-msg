@@ -1,4 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
+import douyinEmoji from "./douyin-emoji.json";
+
+const emojiByName = new Map<string, string>(Object.entries(douyinEmoji));
 
 type ThemeName = "light" | "dark";
 const themeKey = "easy-msg-theme";
@@ -48,6 +51,8 @@ interface ChatMessage {
   fromMe: boolean;
   time: string;
   image?: string;
+  pending?: boolean;
+  failed?: boolean;
 }
 
 interface PendingImage {
@@ -99,6 +104,8 @@ const text = {
   picture: "\u56fe\u7247",
   remove: "\u79fb\u9664",
   pictureText: "[\u56fe\u7247]",
+  sending: "\u53d1\u9001\u4e2d",
+  sendFailed: "\u6ca1\u53d1\u51fa\u53bb",
   tooBig: "\u56fe\u7247\u4e0d\u80fd\u8d85\u8fc7 8MB",
   badImage: "\u53ea\u80fd\u53d1\u9001\u56fe\u7247",
 };
@@ -116,6 +123,7 @@ const state: {
   filter: "all" | PlatformId;
   query: string;
   busy: boolean;
+  sending: boolean;
   status: string;
   threadWarning: string;
 } = {
@@ -126,6 +134,7 @@ const state: {
   filter: "all",
   query: "",
   busy: false,
+  sending: false,
   status: "",
   threadWarning: "",
 };
@@ -148,12 +157,16 @@ const messages = el("div", "messages");
 const composer = el("form", "composer");
 const draft = el("textarea") as HTMLTextAreaElement;
 const sendButton = el("button", "primary");
+const sendSpinner = el("span", "spin");
+const sendIcon = icon("send");
+const sendLabel = document.createTextNode(text.send);
 
 search.type = "search";
 search.placeholder = text.search;
 draft.placeholder = text.compose;
 sendButton.type = "submit";
-sendButton.append(icon("send"), document.createTextNode(text.send));
+sendSpinner.hidden = true;
+sendButton.append(sendSpinner, sendIcon, sendLabel);
 
 const brand = el("div", "brand");
 const themeSwitch = el("div", "theme-switch");
@@ -224,33 +237,32 @@ attach.append(attachImg, attachRemove);
 composerBar.append(emojiButton, imageButton, attach, sendButton);
 composer.append(draft, composerBar, emojiPop, fileInput);
 
-const emoji = [
-  0x1f600, 0x1f603, 0x1f604, 0x1f601, 0x1f606, 0x1f605, 0x1f602, 0x1f923, 0x1f60a, 0x1f970,
-  0x1f60d, 0x1f618, 0x1f60e, 0x1f914, 0x1f92b, 0x1f917, 0x1f97a, 0x1f60f, 0x1f644, 0x1f62e,
-  0x1f62d, 0x1f622, 0x1f621, 0x1f631, 0x1f92f, 0x1f634, 0x1f973, 0x1f60c, 0x1f637, 0x1f924,
-  0x1f44d, 0x1f44e, 0x1f44c, 0x270c, 0x1f91e, 0x1f44a, 0x1f91d, 0x1f64f, 0x1f44f, 0x1f64c, 0x1f4aa,
-  0x2764, 0x1f9e1, 0x1f49b, 0x1f49a, 0x1f499, 0x1f49c, 0x1f5a4, 0x1f494, 0x1f495, 0x1f496, 0x1f497,
-  0x1f525, 0x2728, 0x2b50, 0x1f31f, 0x1f389, 0x1f381, 0x1f339, 0x1f340, 0x2600, 0x1f319, 0x26a1,
-  0x2615, 0x1f382, 0x1f370, 0x1f349, 0x2705, 0x274c, 0x2753, 0x2757, 0x1f4af,
-  0x1f436, 0x1f431, 0x1f43c, 0x1f98a, 0x1f437, 0x1f438,
-].map((code) => String.fromCodePoint(code));
-for (const symbol of emoji) {
-  const button = el("button");
-  button.type = "button";
-  button.textContent = symbol;
-  button.title = symbol;
-  button.addEventListener("click", () => {
-    const start = draft.selectionStart ?? draft.value.length;
-    const end = draft.selectionEnd ?? start;
-    draft.setRangeText(symbol, start, end, "end");
-    draft.focus();
-    emojiPop.hidden = true;
-    refreshSend();
-  });
-  emojiPop.append(button);
+let emojiReady = false;
+function fillEmojiPop(): void {
+  if (emojiReady) return;
+  emojiReady = true;
+  for (const [name, src] of emojiByName) {
+    const button = el("button");
+    const image = el("img") as HTMLImageElement;
+    button.type = "button";
+    button.title = name;
+    image.src = src;
+    image.alt = name;
+    button.append(image);
+    button.addEventListener("click", () => {
+      const start = draft.selectionStart ?? draft.value.length;
+      const end = draft.selectionEnd ?? start;
+      draft.setRangeText(name, start, end, "end");
+      draft.focus();
+      emojiPop.hidden = true;
+      refreshSend();
+    });
+    emojiPop.append(button);
+  }
 }
 emojiPop.addEventListener("mousedown", (event) => event.preventDefault());
 emojiButton.addEventListener("click", () => {
+  fillEmojiPop();
   emojiPop.hidden = !emojiPop.hidden;
 });
 document.addEventListener("click", (event) => {
@@ -321,6 +333,29 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, v
   if (className) node.className = className;
   if (value !== undefined) node.textContent = value;
   return node;
+}
+
+function appendRich(parent: HTMLElement, value: string): void {
+  const pattern = /\[([^\[\]\n]{1,16})\]/g;
+  let cursor = 0;
+  for (const match of value.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    if (index > cursor) parent.append(document.createTextNode(value.slice(cursor, index)));
+    const token = match[0];
+    const src = emojiByName.get(token);
+    if (!src) {
+      parent.append(document.createTextNode(token));
+    } else {
+      const image = el("img", "token-emoji") as HTMLImageElement;
+      image.src = src;
+      image.alt = token;
+      image.title = token;
+      image.addEventListener("error", () => image.replaceWith(document.createTextNode(token)));
+      parent.append(image);
+    }
+    cursor = index + token.length;
+  }
+  if (cursor < value.length) parent.append(document.createTextNode(value.slice(cursor)));
 }
 
 function icon(name: "send" | "sync" | "sun" | "moon" | "smile" | "image" | "x"): SVGElement {
@@ -402,7 +437,11 @@ function activeConversation(): Conversation | undefined {
 let pendingImage: PendingImage | null = null;
 
 function refreshSend(): void {
-  sendButton.disabled = state.busy || !activeConversation() || (!draft.value.trim() && !pendingImage);
+  sendButton.classList.toggle("sending", state.sending);
+  sendSpinner.hidden = !state.sending;
+  sendIcon.style.display = state.sending ? "none" : "";
+  sendLabel.data = state.sending ? text.sending : text.send;
+  sendButton.disabled = state.sending || state.busy || !activeConversation() || (!draft.value.trim() && !pendingImage);
 }
 
 function renderAttach(): void {
@@ -557,6 +596,7 @@ async function syncPlatform(platform: PlatformId): Promise<void> {
   await run(text.sync, async () => {
     await syncOne(platform, true);
   });
+  await followConversationUpdates();
 }
 
 async function syncAll(): Promise<void> {
@@ -565,39 +605,269 @@ async function syncAll(): Promise<void> {
       if (state.accounts?.[platform.id].bound) await syncOne(platform.id, false);
     }
   });
+  await followConversationUpdates();
 }
 
-async function loadConversation(item: Conversation): Promise<void> {
-  state.activeKey = keyOf(item);
+let threadToken = 0;
+let threadRefreshing = false;
+let threadRefreshAgain = false;
+const seenThreads = new Map<string, string>();
+
+function conversationStamp(item: Conversation): string {
+  return item.preview + "\n" + item.time + "\n" + String(item.unread);
+}
+
+function consumeConversationChanges(): Conversation[] {
+  const changed: Conversation[] = [];
+  const live = new Set<string>();
+  for (const item of state.conversations) {
+    const key = keyOf(item);
+    live.add(key);
+    const stamp = conversationStamp(item);
+    const previous = seenThreads.get(key);
+    if (previous !== undefined && previous !== stamp) changed.push(item);
+    seenThreads.set(key, stamp);
+  }
+  for (const key of [...seenThreads.keys()]) {
+    if (!live.has(key)) seenThreads.delete(key);
+  }
+  return changed;
+}
+
+const threadStore = "easy-msg-threads";
+const threadCache = new Map<string, ChatMessage[]>();
+let cacheTimer = 0;
+
+function cacheMessages(value: unknown): ChatMessage[] {
+  if (!Array.isArray(value)) return [];
+  const messages: ChatMessage[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Partial<ChatMessage>;
+    if (typeof row.id !== "string" || typeof row.text !== "string" || !row.text) continue;
+    if (row.id.startsWith("preview-") || row.pending) continue;
+    const image = typeof row.image === "string" && row.image.startsWith("https://") ? row.image : undefined;
+    messages.push({
+      id: row.id,
+      text: row.text.slice(0, 2000),
+      fromMe: Boolean(row.fromMe),
+      time: typeof row.time === "string" ? row.time : "",
+      image,
+      failed: row.failed ? true : undefined,
+    });
+  }
+  return messages.slice(-40);
+}
+
+function readThreadCache(): void {
+  try {
+    const raw = localStorage.getItem(threadStore);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    for (const [key, value] of Object.entries(parsed)) {
+      const messages = cacheMessages(value);
+      if (messages.length) threadCache.set(key, messages);
+    }
+  } catch {
+    return;
+  }
+}
+
+function rememberThread(key: string, messages: ChatMessage[]): void {
+  const clean = cacheMessages(messages);
+  if (!clean.length) return;
+  threadCache.set(key, clean);
+  window.clearTimeout(cacheTimer);
+  cacheTimer = window.setTimeout(() => {
+    const entries = [...threadCache.entries()].slice(-60);
+    const payload: Record<string, ChatMessage[]> = {};
+    for (const [id, rows] of entries) payload[id] = rows;
+    try {
+      localStorage.setItem(threadStore, JSON.stringify(payload));
+    } catch {
+      return;
+    }
+  }, 200);
+}
+
+readThreadCache();
+
+function sameMessages(current: ChatMessage[], next: ChatMessage[]): boolean {
+  if (current.length !== next.length) return false;
+  return current.every((message, index) => {
+    const other = next[index];
+    return message.text === other.text && message.fromMe === other.fromMe && message.time === other.time && (message.image || "") === (other.image || "");
+  });
+}
+
+async function refreshActiveThread(): Promise<void> {
+  if (state.busy || state.sending) return;
+  if (threadRefreshing) {
+    threadRefreshAgain = true;
+    return;
+  }
+  const item = activeConversation();
+  if (!item) return;
+  const token = threadToken;
+  const key = state.activeKey;
+  threadRefreshing = true;
+  try {
+    do {
+      threadRefreshAgain = false;
+      const result = await invoke<ThreadResult>("load_thread", {
+        platform: item.platform,
+        id: item.id,
+        title: item.title,
+      });
+      if (token !== threadToken || state.activeKey !== key || state.busy) return;
+      rememberAccounts(result.accounts);
+      if (!result.messages.length) continue;
+      const tail = result.messages[result.messages.length - 1];
+      let listDirty = false;
+      if (item.preview !== tail.text) {
+        item.preview = tail.text;
+        listDirty = true;
+      }
+      if (tail.time && item.time !== tail.time) {
+        item.time = tail.time;
+        listDirty = true;
+      }
+      seenThreads.set(key, conversationStamp(item));
+      if (sameMessages(state.messages, result.messages)) {
+        rememberThread(key, result.messages);
+        if (listDirty) renderList();
+        continue;
+      }
+      const distance = messages.scrollHeight - messages.scrollTop - messages.clientHeight;
+      state.messages = result.messages;
+      rememberThread(key, result.messages);
+      state.threadWarning = "";
+      if (listDirty) renderList();
+      renderThread(distance < 96);
+    } while (threadRefreshAgain && !state.busy && token === threadToken && state.activeKey === key);
+  } catch {
+    return;
+  } finally {
+    threadRefreshing = false;
+  }
+}
+
+async function followConversationUpdates(): Promise<void> {
+  const changed = consumeConversationChanges();
+  if (state.activeKey) {
+    await refreshActiveThread();
+    return;
+  }
+  const next = changed.find((item) => item.unread > 0) || changed[0];
+  if (next) await loadConversation(next);
+}
+
+let switchTimer = 0;
+
+function showConversation(item: Conversation): void {
+  const key = keyOf(item);
+  const cached = threadCache.get(key);
+  state.messages = cached
+    ? cached.map((message) => ({ ...message }))
+    : item.preview
+      ? [{ id: "preview-" + item.id, text: item.preview, fromMe: false, time: item.time }]
+      : [];
+  state.threadWarning = "";
+  state.status = item.title;
   renderList();
-  await run(item.title, async () => {
+  renderThread();
+  footer.textContent = state.status;
+  refreshSend();
+}
+
+async function fetchConversation(item: Conversation, token: number, key: string): Promise<void> {
+  if (token !== threadToken || state.activeKey !== key || state.sending) return;
+  try {
     const result = await invoke<ThreadResult>("load_thread", {
       platform: item.platform,
       id: item.id,
       title: item.title,
     });
+    if (token !== threadToken || state.activeKey !== key || state.sending) return;
     rememberAccounts(result.accounts);
+    const live = state.conversations.find((entry) => keyOf(entry) === key) || item;
     const tail = result.messages[result.messages.length - 1];
+    let listDirty = false;
     if (tail) {
-      item.preview = tail.text;
-      if (tail.time) item.time = tail.time;
+      if (live.preview !== tail.text) {
+        live.preview = tail.text;
+        listDirty = true;
+      }
+      if (tail.time && live.time !== tail.time) {
+        live.time = tail.time;
+        listDirty = true;
+      }
+      seenThreads.set(key, conversationStamp(live));
     }
-    state.messages = result.messages.length
-      ? result.messages
-      : item.preview
-        ? [{ id: "preview-" + item.id, text: item.preview, fromMe: false, time: item.time }]
-        : [];
-    state.threadWarning = result.messages.length ? result.warning : item.preview ? "" : result.warning;
-    state.status = state.threadWarning || item.title;
-  });
+    if (result.messages.length) {
+      rememberThread(key, result.messages);
+      state.threadWarning = result.warning;
+      if (!sameMessages(state.messages, result.messages)) {
+        const distance = messages.scrollHeight - messages.scrollTop - messages.clientHeight;
+        state.messages = result.messages;
+        if (token === threadToken && state.activeKey === key) renderThread(distance < 96);
+      }
+    } else if (!threadCache.has(key)) {
+      state.threadWarning = live.preview ? "" : result.warning;
+    }
+    state.status = state.threadWarning || live.title;
+    if (listDirty && token === threadToken && state.activeKey === key) renderList();
+  } catch (error) {
+    if (token !== threadToken || state.activeKey !== key) return;
+    if (!threadCache.has(key)) {
+      state.threadWarning = errorText(error);
+      state.status = state.threadWarning;
+    }
+  }
+  if (token === threadToken && state.activeKey === key) {
+    footer.textContent = state.status;
+    refreshSend();
+  }
+}
+
+async function loadConversation(item: Conversation): Promise<void> {
+  threadToken += 1;
+  const token = threadToken;
+  const key = keyOf(item);
+  state.activeKey = key;
+  showConversation(item);
+  window.clearTimeout(switchTimer);
+  switchTimer = window.setTimeout(() => {
+    void fetchConversation(item, token, key);
+  }, 80);
 }
 
 async function sendCurrent(): Promise<void> {
+  if (state.sending || state.busy) return;
+  threadToken += 1;
   const item = activeConversation();
   const value = draft.value.trim();
   const image = pendingImage;
   if (!item || (!value && !image)) return;
-  await run(text.send, async () => {
+  const key = keyOf(item);
+  const localId = "local-" + Date.now();
+  const local: ChatMessage = {
+    id: localId,
+    text: value || text.pictureText,
+    fromMe: true,
+    time: "",
+    pending: true,
+    image: image ? image.preview : undefined,
+  };
+  state.sending = true;
+  state.status = text.sending;
+  state.messages = [...state.messages, local];
+  draft.value = "";
+  pendingImage = null;
+  renderAttach();
+  renderThread();
+  footer.textContent = text.sending;
+  try {
     const result = await invoke<ThreadResult>("send_message", {
       platform: item.platform,
       id: item.id,
@@ -605,30 +875,55 @@ async function sendCurrent(): Promise<void> {
       text: value,
       image: image ? { name: image.name, mime: image.mime, data: image.data } : null,
     });
+    if (state.activeKey !== key) return;
     rememberAccounts(result.accounts);
-    state.threadWarning = result.warning;
-    const next = result.messages.length
-      ? result.messages.map((message) => ({ ...message }))
-      : [
-          ...state.messages,
-          ...(value ? [{ id: `local-${Date.now()}`, text: value, fromMe: true, time: "" }] : []),
-          ...(image ? [{ id: `local-img-${Date.now()}`, text: text.pictureText, fromMe: true, time: "", image: image.preview }] : []),
-        ];
+    const textOk = !value || Boolean(result.textSent);
+    const imageOk = !image || Boolean(result.imageSent);
+    const ok = textOk && imageOk;
+    const server = result.messages.map((message) => ({ ...message }));
     if (image) {
-      for (let index = next.length - 1; index >= 0; index -= 1) {
-        const message = next[index];
+      for (let index = server.length - 1; index >= 0; index -= 1) {
+        const message = server[index];
         if (message.fromMe && message.text.includes("\u56fe\u7247") && !message.image) {
           message.image = image.preview;
           break;
         }
       }
     }
-    state.messages = next;
-    if (!value || result.textSent) draft.value = "";
-    if (!image || result.imageSent) pendingImage = null;
-    renderAttach();
-    state.status = result.warning || text.send;
-  });
+    const echoed = !value || server.some((message) => message.fromMe && message.text.replace(/\s+/g, "") === value.replace(/\s+/g, ""));
+    if (server.length && (echoed || !ok)) {
+      const kept = echoed || !value ? [] : [{ ...local, pending: false, failed: !ok }];
+      state.messages = [...server, ...kept];
+    } else {
+      state.messages = state.messages.map((message) => message.id === localId ? { ...message, pending: false, failed: !ok } : message);
+    }
+    if (!ok) {
+      if (!draft.value.trim() && value) draft.value = value;
+      if (image && !imageOk) pendingImage = image;
+      state.threadWarning = result.warning || text.sendFailed;
+      state.status = state.threadWarning;
+    } else {
+      state.threadWarning = result.warning;
+      state.status = result.warning;
+    }
+  } catch (error) {
+    if (state.activeKey === key) {
+      state.messages = state.messages.map((message) => message.id === localId ? { ...message, pending: false, failed: true } : message);
+      if (!draft.value.trim() && value) draft.value = value;
+      if (image) pendingImage = image;
+      state.threadWarning = errorText(error);
+      state.status = state.threadWarning;
+    }
+  } finally {
+    state.sending = false;
+    if (state.activeKey === key) {
+      renderThread();
+      renderAttach();
+    }
+    footer.textContent = state.status;
+    refreshSend();
+    if (state.activeKey === key) rememberThread(key, state.messages);
+  }
 }
 
 function renderAccounts(): void {
@@ -729,7 +1024,9 @@ function renderList(): void {
     const tag = el("span", `tag ${item.platform}`, item.platform === "xhs" ? text.xhs : text.douyin);
     const titleRow = el("div", "title-row");
     titleRow.append(tag, title);
-    body.append(titleRow, el("div", "preview ellipsis", item.preview));
+    const preview = el("div", "preview ellipsis");
+    appendRich(preview, item.preview);
+    body.append(titleRow, preview);
     button.append(body);
     const side = el("div");
     side.append(el("div", "time", item.time));
@@ -740,8 +1037,9 @@ function renderList(): void {
   }
 }
 
-function renderThread(): void {
+function renderThread(stickToEnd = true): void {
   const item = activeConversation();
+  const previousTop = messages.scrollTop;
   threadHead.replaceChildren();
   if (!item) {
     messages.replaceChildren();
@@ -756,6 +1054,8 @@ function renderThread(): void {
   messages.replaceChildren();
   for (const message of state.messages) {
     const bubble = el("div", message.fromMe ? "bubble mine" : "bubble");
+    if (message.pending) bubble.classList.add("pending");
+    if (message.failed) bubble.classList.add("failed");
     const showText = message.text && !(message.image && message.text === text.pictureText);
     if (message.image) {
       const shot = el("img", "shot") as HTMLImageElement;
@@ -767,11 +1067,13 @@ function renderThread(): void {
       });
       bubble.append(shot);
     }
-    if (showText || !message.image) bubble.append(document.createTextNode(message.text));
-    if (message.time) bubble.append(el("span", "time", message.time));
+    if (showText || !message.image) appendRich(bubble, message.text);
+    if (message.pending) bubble.append(el("span", "time", text.sending));
+    else if (message.failed) bubble.append(el("span", "time", text.sendFailed));
+    else if (message.time) bubble.append(el("span", "time", message.time));
     messages.append(bubble);
   }
-  messages.scrollTop = messages.scrollHeight;
+  messages.scrollTop = stickToEnd ? messages.scrollHeight : previousTop;
   refreshSend();
 }
 
@@ -782,6 +1084,7 @@ async function syncBound(): Promise<void> {
   await run(text.sync, async () => {
     for (const platform of bound) await syncOne(platform.id, false);
   });
+  await followConversationUpdates();
 }
 
 async function recoverLogins(): Promise<void> {
@@ -811,5 +1114,13 @@ void refreshStatus()
 window.setInterval(() => {
   void syncBound();
 }, 60000);
+
+window.setInterval(() => {
+  void refreshActiveThread();
+}, 15000);
+
+window.addEventListener("focus", () => {
+  void refreshActiveThread();
+});
 
 renderFilters();

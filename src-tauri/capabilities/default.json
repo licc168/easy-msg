@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "allow-session-status",
+    "allow-open-platform",
+    "allow-confirm-login",
+    "allow-sync-platform",
+    "allow-load-thread",
+    "allow-send-message"
+  ]
+}

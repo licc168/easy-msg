@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import douyinEmoji from "./douyin-emoji.json";
 
 const emojiByName = new Map<string, string>(Object.entries(douyinEmoji));
@@ -20,6 +22,8 @@ type PlatformId = "xhs" | "douyin";
 type EntryId = "home" | "messages" | "creator";
 
 interface Account {
+  id: string;
+  platform: PlatformId;
   bound: boolean;
   nickname: string;
   avatar: string;
@@ -31,8 +35,7 @@ interface Account {
 }
 
 interface Accounts {
-  xhs: Account;
-  douyin: Account;
+  accounts: Account[];
 }
 
 interface Conversation {
@@ -43,6 +46,7 @@ interface Conversation {
   unread: number;
   avatar: string;
   platform: PlatformId;
+  accountId?: string;
 }
 
 interface ChatMessage {
@@ -108,6 +112,17 @@ const text = {
   sendFailed: "\u6ca1\u53d1\u51fa\u53bb",
   tooBig: "\u56fe\u7247\u4e0d\u80fd\u8d85\u8fc7 8MB",
   badImage: "\u53ea\u80fd\u53d1\u9001\u56fe\u7247",
+  notifyOn: "\u901a\u77e5\u5df2\u5f00\u542f",
+  notifyOff: "\u901a\u77e5\u5df2\u5173\u95ed",
+  newMessage: "\u65b0\u6d88\u606f",
+  hide: "\u9690\u85cf",
+  unhide: "\u6062\u590d",
+  deleteChat: "\u5220\u9664",
+  hidden: "\u9690\u85cf",
+  hiddenEmpty: "\u6ca1\u6709\u9690\u85cf\u7684\u5bf9\u8bdd",
+  addAccount: "\u6dfb\u52a0\u8d26\u53f7",
+  removeAccount: "\u79fb\u9664\u8d26\u53f7",
+  loading: "\u6b63\u5728\u540c\u6b65\u4f1a\u8bdd",
 };
 
 const platforms: Array<{ id: PlatformId; name: string }> = [
@@ -120,9 +135,11 @@ const state: {
   conversations: Conversation[];
   messages: ChatMessage[];
   activeKey: string;
-  filter: "all" | PlatformId;
+  filter: "all" | PlatformId | "hidden";
+  accountFilter: string;
   query: string;
   busy: boolean;
+  booting: boolean;
   sending: boolean;
   status: string;
   threadWarning: string;
@@ -132,8 +149,10 @@ const state: {
   messages: [],
   activeKey: "",
   filter: "all",
+  accountFilter: "",
   query: "",
   busy: false,
+  booting: true,
   sending: false,
   status: "",
   threadWarning: "",
@@ -204,10 +223,43 @@ mark.src = "/brand.png";
 mark.alt = "";
 mark.width = 28;
 mark.height = 28;
-brand.append(mark, el("strong", undefined, text.app), themeSwitch);
+const notifyKey = "easy-msg-notify";
+const notifyButton = el("button", "icon-button notify-toggle");
+notifyButton.type = "button";
+
+function noticesEnabled(): boolean {
+  try {
+    return localStorage.getItem(notifyKey) !== "off";
+  } catch {
+    return true;
+  }
+}
+
+function paintNotify(): void {
+  const on = noticesEnabled();
+  notifyButton.replaceChildren(icon(on ? "bell" : "bell-off"));
+  notifyButton.setAttribute("aria-pressed", on ? "true" : "false");
+  notifyButton.title = on ? text.notifyOn : text.notifyOff;
+  notifyButton.setAttribute("aria-label", notifyButton.title);
+}
+
+notifyButton.addEventListener("click", () => {
+  const turningOn = !noticesEnabled();
+  try {
+    localStorage.setItem(notifyKey, turningOn ? "on" : "off");
+  } catch {
+    /* private mode */
+  }
+  paintNotify();
+  if (turningOn) void allowSystemNotice();
+});
+paintNotify();
+if (noticesEnabled()) void allowSystemNotice();
+brand.append(mark, el("strong", undefined, text.app), notifyButton, themeSwitch);
 paintTheme(savedTheme());
 accountPane.append(brand, accountList, footer);
-listHead.append(search, filters);
+const accountFilters = el("div", "filters account-filters");
+listHead.append(search, filters, accountFilters);
 listPane.append(listHead, list);
 const composerBar = el("div", "composer-bar");
 const emojiButton = el("button", "icon-button");
@@ -297,13 +349,17 @@ attachRemove.addEventListener("click", () => {
 });
 threadPane.append(threadHead, messages, composer);
 shell.append(accountPane, listPane, threadPane);
-app.append(shell);
+const toastRoot = el("div", "toasts");
+toastRoot.setAttribute("aria-live", "polite");
+app.append(shell, toastRoot);
 
-for (const item of [{ id: "all" as const, label: text.all }, ...platforms.map((item) => ({ id: item.id, label: item.name }))]) {
+for (const item of [{ id: "all" as const, label: text.all }, ...platforms.map((item) => ({ id: item.id, label: item.name })), { id: "hidden" as const, label: text.hidden }]) {
   const button = el("button", undefined, item.label);
   button.dataset.filter = item.id;
   button.addEventListener("click", () => {
     state.filter = item.id;
+    if (item.id !== "all" && item.id !== "hidden" && state.accountFilter && !state.accountFilter.startsWith(item.id + ":")) state.accountFilter = "";
+    if (item.id === "hidden") state.accountFilter = "";
     renderFilters();
     renderList();
   });
@@ -358,7 +414,7 @@ function appendRich(parent: HTMLElement, value: string): void {
   if (cursor < value.length) parent.append(document.createTextNode(value.slice(cursor)));
 }
 
-function icon(name: "send" | "sync" | "sun" | "moon" | "smile" | "image" | "x"): SVGElement {
+function icon(name: "send" | "sync" | "sun" | "moon" | "smile" | "image" | "x" | "bell" | "bell-off" | "eye" | "eye-off" | "trash"): SVGElement {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 24 24");
   svg.setAttribute("width", "15");
@@ -405,6 +461,11 @@ function icon(name: "send" | "sync" | "sun" | "moon" | "smile" | "image" | "x"):
     paths.push("m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21");
   }
   if (name === "x") paths.push("M18 6 6 18", "m6 6 12 12");
+  if (name === "bell") paths.push("M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9", "M10.3 21a1.94 1.94 0 0 0 3.4 0");
+  if (name === "bell-off") paths.push("M13.73 21a2 2 0 0 1-3.46 0", "M18.63 13A17.89 17.89 0 0 1 18 8", "M6.26 6.26A5.86 5.86 0 0 0 6 8c0 7-3 9-3 9h14", "M18 8a6 6 0 0 0-9.33-5", "m2 2 20 20");
+  if (name === "eye") paths.push("M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z");
+  if (name === "eye-off") paths.push("M9.88 9.88a3 3 0 1 0 4.24 4.24", "M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68", "M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61", "m2 2 20 20");
+  if (name === "trash") paths.push("M3 6h18", "M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6", "M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2");
   for (const value of paths) {
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
     path.setAttribute("d", value);
@@ -427,7 +488,19 @@ function clock(ms: number): string {
 }
 
 function keyOf(item: Conversation): string {
-  return `${item.platform}:${item.id}`;
+  return item.platform + ":" + (item.accountId || "main") + ":" + item.id;
+}
+
+function accountSlots(): Account[] {
+  return state.accounts?.accounts ?? [];
+}
+
+function findAccount(platform: PlatformId, id = "main"): Account | undefined {
+  return accountSlots().find((item) => item.platform === platform && item.id === id);
+}
+
+function accountKey(account: Account): string {
+  return account.platform + ":" + account.id;
 }
 
 function activeConversation(): Conversation | undefined {
@@ -534,28 +607,29 @@ async function refreshStatus(): Promise<void> {
   renderAccounts();
 }
 
-const loginTimers: Partial<Record<PlatformId, number>> = {};
+const loginTimers = new Map<string, number>();
 
-function watchLogin(platform: PlatformId): void {
-  window.clearInterval(loginTimers[platform]);
+function watchLogin(platform: PlatformId, accountId: string): void {
+  const timerKey = platform + ":" + accountId;
+  window.clearInterval(loginTimers.get(timerKey));
   let tries = 0;
   let running = false;
-  loginTimers[platform] = window.setInterval(() => {
+  loginTimers.set(timerKey, window.setInterval(() => {
     tries += 1;
-    if (tries > 40 || state.accounts?.[platform].bound) {
-      window.clearInterval(loginTimers[platform]);
+    if (tries > 40 || findAccount(platform, accountId)?.bound) {
+      window.clearInterval(loginTimers.get(timerKey));
       return;
     }
     if (running || state.busy) return;
     running = true;
-    void invoke<Accounts>("probe_login", { platform })
+    void invoke<Accounts>("probe_login", { platform, accountId })
       .then(async (accounts) => {
-        const became = !state.accounts?.[platform].bound && accounts[platform].bound;
+        const became = !findAccount(platform, accountId)?.bound && accounts.accounts.some((item) => item.platform === platform && item.id === accountId && item.bound);
         rememberAccounts(accounts);
         renderAccounts();
         if (!became) return;
-        window.clearInterval(loginTimers[platform]);
-        await syncOne(platform, false);
+        window.clearInterval(loginTimers.get(timerKey));
+        await syncOne(platform, accountId, false);
         renderList();
         footer.textContent = state.status;
       })
@@ -563,49 +637,73 @@ function watchLogin(platform: PlatformId): void {
       .finally(() => {
         running = false;
       });
-  }, 2000);
+  }, 2000));
 }
 
-async function openPlatform(platform: PlatformId, entry: EntryId): Promise<void> {
+async function openPlatform(platform: PlatformId, accountId: string, entry: EntryId): Promise<void> {
   await run(text.open, async () => {
-    rememberAccounts(await invoke<Accounts>("open_platform", { platform, entry, focus: true }));
+    rememberAccounts(await invoke<Accounts>("open_platform", { platform, accountId, entry, focus: true }));
     state.status = text.windowOn;
   });
-  if (entry === "home") watchLogin(platform);
+  if (entry === "home") watchLogin(platform, accountId);
 }
 
-async function confirm(platform: PlatformId, force: boolean): Promise<void> {
+async function confirm(platform: PlatformId, accountId: string, force: boolean): Promise<void> {
   await run(text.done, async () => {
-    rememberAccounts(await invoke<Accounts>("confirm_login", { platform, force }));
-    state.status = state.accounts?.[platform].nickname || text.done;
-    await syncOne(platform, false);
+    rememberAccounts(await invoke<Accounts>("confirm_login", { platform, accountId, force }));
+    state.status = findAccount(platform, accountId)?.nickname || text.done;
+    await syncOne(platform, accountId, false);
   });
 }
 
-async function syncOne(platform: PlatformId, interactive: boolean): Promise<void> {
-  const result = await invoke<SyncResult>("sync_platform", { platform, interactive });
+async function syncOne(platform: PlatformId, accountId: string, interactive: boolean): Promise<void> {
+  const result = await invoke<SyncResult>("sync_platform", { platform, accountId, interactive });
   rememberAccounts(result.accounts);
   state.conversations = [
-    ...state.conversations.filter((item) => item.platform !== platform),
-    ...result.conversations,
+    ...state.conversations.filter((item) => item.platform !== platform || (item.accountId || "main") !== accountId),
+    ...dropDeleted(result.conversations),
   ];
+  renderList();
   state.status = result.warning || `${platforms.find((item) => item.id === platform)?.name} ${result.conversations.length}`;
 }
 
-async function syncPlatform(platform: PlatformId): Promise<void> {
+async function syncPlatform(platform: PlatformId, accountId: string): Promise<void> {
   await run(text.sync, async () => {
-    await syncOne(platform, true);
+    await syncOne(platform, accountId, true);
   });
   await followConversationUpdates();
 }
 
 async function syncAll(): Promise<void> {
   await run(text.syncAll, async () => {
-    for (const platform of platforms) {
-      if (state.accounts?.[platform.id].bound) await syncOne(platform.id, false);
+    for (const account of accountSlots()) {
+      if (account.bound) await syncOne(account.platform, account.id, false);
     }
   });
   await followConversationUpdates();
+}
+
+async function addAccount(platform: PlatformId): Promise<void> {
+  const before = new Set(accountSlots().filter((item) => item.platform === platform).map((item) => item.id));
+  await run(text.addAccount, async () => {
+    rememberAccounts(await invoke<Accounts>("add_account", { platform }));
+  });
+  const created = accountSlots().find((item) => item.platform === platform && !before.has(item.id));
+  if (created) await openPlatform(platform, created.id, "home");
+}
+
+async function removeAccount(account: Account): Promise<void> {
+  const name = account.nickname || platforms.find((item) => item.id === account.platform)?.name || "";
+  if (!window.confirm("\u79fb\u9664\u8d26\u53f7\u300c" + name + "\u300d\uff1f")) return;
+  await run(text.removeAccount, async () => {
+    rememberAccounts(await invoke<Accounts>("remove_account", { platform: account.platform, accountId: account.id }));
+    state.conversations = state.conversations.filter((item) => item.platform !== account.platform || (item.accountId || "main") !== account.id);
+    if (state.activeKey.startsWith(account.platform + ":" + account.id + ":")) {
+      state.activeKey = "";
+      state.messages = [];
+      renderThread();
+    }
+  });
 }
 
 let threadToken = 0;
@@ -617,6 +715,84 @@ function conversationStamp(item: Conversation): string {
   return item.preview + "\n" + item.time + "\n" + String(item.unread);
 }
 
+const hiddenStore = "easy-msg-hidden";
+const deletedStore = "easy-msg-deleted";
+const hiddenKeys = new Set<string>();
+const deletedStamps = new Map<string, string>();
+
+function loadLocalSets(): void {
+  try {
+    const hidden = JSON.parse(localStorage.getItem(hiddenStore) || "[]") as unknown;
+    if (Array.isArray(hidden)) {
+      for (const key of hidden) if (typeof key === "string") hiddenKeys.add(key);
+    }
+  } catch { /* ignore */ }
+  try {
+    const deleted = JSON.parse(localStorage.getItem(deletedStore) || "{}") as unknown;
+    if (deleted && typeof deleted === "object") {
+      for (const [key, value] of Object.entries(deleted as Record<string, unknown>)) {
+        if (typeof value === "string") deletedStamps.set(key, value);
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+function saveHidden(): void {
+  try { localStorage.setItem(hiddenStore, JSON.stringify([...hiddenKeys])); } catch { /* ignore */ }
+}
+
+function saveDeleted(): void {
+  try { localStorage.setItem(deletedStore, JSON.stringify(Object.fromEntries(deletedStamps))); } catch { /* ignore */ }
+}
+
+loadLocalSets();
+
+function isHidden(item: Conversation): boolean {
+  return hiddenKeys.has(keyOf(item));
+}
+
+function dropDeleted(items: Conversation[]): Conversation[] {
+  return items.filter((item) => {
+    const key = keyOf(item);
+    const stamp = conversationStamp(item);
+    const deleted = deletedStamps.get(key);
+    if (!deleted) return true;
+    if (deleted === stamp) return false;
+    deletedStamps.delete(key);
+    saveDeleted();
+    return true;
+  });
+}
+
+function hideConversation(item: Conversation): void {
+  hiddenKeys.add(keyOf(item));
+  saveHidden();
+  renderFilters();
+  renderList();
+}
+
+function unhideConversation(item: Conversation): void {
+  hiddenKeys.delete(keyOf(item));
+  saveHidden();
+  renderFilters();
+  renderList();
+}
+
+function deleteConversation(item: Conversation): void {
+  const key = keyOf(item);
+  deletedStamps.set(key, conversationStamp(item));
+  saveDeleted();
+  hiddenKeys.delete(key);
+  saveHidden();
+  state.conversations = state.conversations.filter((entry) => keyOf(entry) !== key);
+  if (state.activeKey === key) {
+    state.activeKey = "";
+    state.messages = [];
+    renderThread();
+  }
+  renderList();
+}
+
 function consumeConversationChanges(): Conversation[] {
   const changed: Conversation[] = [];
   const live = new Set<string>();
@@ -625,7 +801,10 @@ function consumeConversationChanges(): Conversation[] {
     live.add(key);
     const stamp = conversationStamp(item);
     const previous = seenThreads.get(key);
-    if (previous !== undefined && previous !== stamp) changed.push(item);
+    if (previous !== undefined && previous !== stamp) {
+      changed.push(item);
+      if (isIncoming(item, previous)) showNotice(item);
+    }
     seenThreads.set(key, stamp);
   }
   for (const key of [...seenThreads.keys()]) {
@@ -633,6 +812,150 @@ function consumeConversationChanges(): Conversation[] {
   }
   return changed;
 }
+
+function stampParts(stamp: string): { preview: string; time: string; unread: number } {
+  const parts = stamp.split("\n");
+  const unread = Number(parts.pop());
+  const time = parts.pop() || "";
+  return { preview: parts.join("\n"), time, unread: Number.isFinite(unread) ? unread : 0 };
+}
+
+const outgoingPreview = new Map<string, { text: string; until: number }>();
+
+function noteOutgoing(key: string, text: string): void {
+  const clean = text.replace(/\s+/g, " ").trim();
+  if (!clean) return;
+  outgoingPreview.set(key, { text: clean, until: Date.now() + 120000 });
+}
+
+function isOwnPreview(item: Conversation): boolean {
+  const preview = item.preview.replace(/\s+/g, " ").trim();
+  const sent = outgoingPreview.get(keyOf(item));
+  return Boolean(sent && sent.until > Date.now() && preview === sent.text);
+}
+
+function isIncoming(item: Conversation, previous: string): boolean {
+  if (deletedStamps.has(keyOf(item))) return false;
+  if (isOwnPreview(item)) return false;
+  const old = stampParts(previous);
+  if (item.unread > old.unread) return true;
+  return item.preview !== old.preview;
+}
+
+function foreignTail(previous: ChatMessage[], next: ChatMessage[]): ChatMessage | null {
+  const known = previous.filter((message) => !message.pending && !message.id.startsWith("preview-") && !message.id.startsWith("local-"));
+  if (!known.length || !next.length) return null;
+  const tail = next[next.length - 1];
+  const last = known[known.length - 1];
+  if (!tail || tail.fromMe || tail.pending) return null;
+  if (tail.id === last.id && tail.text === last.text) return null;
+  return tail;
+}
+
+const toastNodes = new Map<string, HTMLButtonElement>();
+const toastTimers = new Map<string, number>();
+
+function dismissNotice(key: string): void {
+  window.clearTimeout(toastTimers.get(key));
+  toastTimers.delete(key);
+  const node = toastNodes.get(key);
+  toastNodes.delete(key);
+  node?.remove();
+}
+
+function noticeAccount(item: Conversation): string {
+  const platformName = platforms.find((entry) => entry.id === item.platform)?.name || "";
+  const account = findAccount(item.platform, item.accountId || "main");
+  return account?.nickname ? platformName + " \u00b7 " + account.nickname : platformName;
+}
+
+
+async function allowSystemNotice(): Promise<boolean> {
+  try {
+    if (await isPermissionGranted()) return true;
+    return (await requestPermission()) === "granted";
+  } catch {
+    return false;
+  }
+}
+
+async function pushSystemNotice(item: Conversation): Promise<boolean> {
+  try {
+    const win = getCurrentWindow();
+    const minimized = await win.isMinimized();
+    const focused = await win.isFocused();
+    if (!minimized && focused) return false;
+    if (!(await allowSystemNotice())) return false;
+    const account = noticeAccount(item);
+    sendNotification({
+      title: item.title || text.newMessage,
+      body: account ? account + " " + (item.preview || text.newMessage) : (item.preview || text.newMessage),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const recentNotices = new Map<string, number>();
+
+function showNotice(item: Conversation): void {
+  if (!noticesEnabled()) return;
+  const key = keyOf(item);
+  const signature = key + "\n" + item.preview;
+  const now = Date.now();
+  const seen = recentNotices.get(signature);
+  if (seen && now - seen < 120000) return;
+  recentNotices.set(signature, now);
+  void pushSystemNotice(item).then((sent) => {
+    if (sent) dismissNotice(key);
+  });
+  dismissNotice(key);
+  const toast = el("button", "toast " + item.platform);
+  toast.type = "button";
+  if (item.avatar) {
+    const image = el("img", "avatar") as HTMLImageElement;
+    image.src = item.avatar;
+    image.alt = "";
+    toast.append(image);
+  } else {
+    toast.append(el("div", "letter", (item.title || "?").slice(0, 1)));
+  }
+  const body = el("div", "toast-copy");
+  body.append(el("div", "name ellipsis", item.title || text.newMessage));
+  body.append(el("div", "toast-meta ellipsis", noticeAccount(item)));
+  body.append(el("div", "preview ellipsis", item.preview || text.newMessage));
+  const close = el("span", "toast-close");
+  close.append(icon("x"));
+  toast.append(body, close);
+  toast.addEventListener("click", (event) => {
+    const target = event.target;
+    if (target instanceof Element && target.closest(".toast-close")) {
+      dismissNotice(key);
+      return;
+    }
+    if (isHidden(item)) unhideConversation(item);
+    void loadConversation(item);
+    dismissNotice(key);
+  });
+  toast.addEventListener("mouseenter", () => window.clearTimeout(toastTimers.get(key)));
+  toast.addEventListener("mouseleave", () => {
+    toastTimers.set(key, window.setTimeout(() => dismissNotice(key), 2200));
+  });
+  toastRoot.prepend(toast);
+  toastNodes.set(key, toast);
+  while (toastRoot.children.length > 4) {
+    const last = toastRoot.lastElementChild;
+    const lastKey = [...toastNodes.entries()].find((entry) => entry[1] === last)?.[0];
+    if (!lastKey) {
+      last?.remove();
+      break;
+    }
+    dismissNotice(lastKey);
+  }
+  toastTimers.set(key, window.setTimeout(() => dismissNotice(key), 7000));
+}
+
 
 const threadStore = "easy-msg-threads";
 const threadCache = new Map<string, ChatMessage[]>();
@@ -716,6 +1039,7 @@ async function refreshActiveThread(): Promise<void> {
       threadRefreshAgain = false;
       const result = await invoke<ThreadResult>("load_thread", {
         platform: item.platform,
+        accountId: item.accountId || "main",
         id: item.id,
         title: item.title,
       });
@@ -724,6 +1048,7 @@ async function refreshActiveThread(): Promise<void> {
       if (!result.messages.length) continue;
       const tail = result.messages[result.messages.length - 1];
       let listDirty = false;
+      const arrived = foreignTail(state.messages, result.messages);
       if (item.preview !== tail.text) {
         item.preview = tail.text;
         listDirty = true;
@@ -732,6 +1057,7 @@ async function refreshActiveThread(): Promise<void> {
         item.time = tail.time;
         listDirty = true;
       }
+      if (arrived && !isOwnPreview(item)) showNotice(item);
       seenThreads.set(key, conversationStamp(item));
       if (sameMessages(state.messages, result.messages)) {
         rememberThread(key, result.messages);
@@ -758,7 +1084,8 @@ async function followConversationUpdates(): Promise<void> {
     await refreshActiveThread();
     return;
   }
-  const next = changed.find((item) => item.unread > 0) || changed[0];
+  const visible = changed.filter((item) => !isHidden(item));
+  const next = visible.find((item) => item.unread > 0) || visible[0];
   if (next) await loadConversation(next);
 }
 
@@ -785,6 +1112,7 @@ async function fetchConversation(item: Conversation, token: number, key: string)
   try {
     const result = await invoke<ThreadResult>("load_thread", {
       platform: item.platform,
+      accountId: item.accountId || "main",
       id: item.id,
       title: item.title,
     });
@@ -850,6 +1178,7 @@ async function sendCurrent(): Promise<void> {
   const image = pendingImage;
   if (!item || (!value && !image)) return;
   const key = keyOf(item);
+  noteOutgoing(key, value || text.pictureText);
   const localId = "local-" + Date.now();
   const local: ChatMessage = {
     id: localId,
@@ -870,6 +1199,7 @@ async function sendCurrent(): Promise<void> {
   try {
     const result = await invoke<ThreadResult>("send_message", {
       platform: item.platform,
+      accountId: item.accountId || "main",
       id: item.id,
       title: item.title,
       text: value,
@@ -926,53 +1256,83 @@ async function sendCurrent(): Promise<void> {
   }
 }
 
+function accountTitle(account: Account): string {
+  const platformName = platforms.find((item) => item.id === account.platform)?.name || account.platform;
+  const peers = accountSlots().filter((item) => item.platform === account.platform);
+  if (!account.bound && !account.nickname) return text.unbound;
+  if (account.nickname && peers.filter((item) => item.nickname === account.nickname).length < 2) return account.nickname;
+  const index = Math.max(1, peers.findIndex((item) => item.id === account.id) + 1);
+  return peers.length > 1 ? platformName + " " + index : (account.nickname || platformName);
+}
+
+function chipLabel(account: Account, pool: Account[]): string {
+  const name = accountTitle(account);
+  const clash = pool.filter((item) => accountTitle(item) === name).length > 1;
+  if (!clash) return name;
+  const platformName = platforms.find((item) => item.id === account.platform)?.name || "";
+  return platformName + " " + name;
+}
+
 function renderAccounts(): void {
   accountList.replaceChildren();
   if (!state.accounts) return;
   for (const platform of platforms) {
-    const account = state.accounts[platform.id];
-    const box = el("section", `account ${platform.id}`);
-    const top = el("div", "account-top");
-    if (account.avatar) {
-      const image = el("img", "avatar") as HTMLImageElement;
-      image.src = account.avatar;
-      image.alt = "";
-      top.append(image);
-    } else {
-      top.append(el("div", "letter", platform.name.slice(0, 1)));
+    accountList.append(el("div", "platform-label", platform.name));
+    const mine = accountSlots().filter((account) => account.platform === platform.id);
+    for (const account of mine) {
+      const box = el("section", `account ${platform.id}`);
+      if (state.accountFilter === accountKey(account)) box.classList.add("selected");
+      const top = el("div", "account-top");
+      if (account.avatar) {
+        const image = el("img", "avatar") as HTMLImageElement;
+        image.src = account.avatar;
+        image.alt = "";
+        top.append(image);
+      } else {
+        top.append(el("div", "letter", (account.nickname || platform.name).slice(0, 1)));
+      }
+      const meta = el("div");
+      meta.append(el("div", "name ellipsis", accountTitle(account)));
+      meta.append(el("div", "sub ellipsis", account.lastSyncAt ? clock(account.lastSyncAt) : ""));
+      top.append(meta);
+      top.addEventListener("click", () => {
+        const key = accountKey(account);
+        state.filter = account.platform;
+        state.accountFilter = state.accountFilter === key ? "" : key;
+        renderFilters();
+        renderAccounts();
+        renderList();
+      });
+      box.append(top);
+      const actions = el("div", "actions");
+      if (!account.bound) {
+        actions.append(
+          actionButton(text.bind, () => void openPlatform(platform.id, account.id, "home")),
+          actionButton(text.done, () => void confirm(platform.id, account.id, false)),
+          actionButton(text.force, () => void confirm(platform.id, account.id, true)),
+        );
+      } else {
+        actions.append(
+          actionButton(text.sync, () => void syncPlatform(platform.id, account.id), true),
+          actionButton(text.relogin, () => void openPlatform(platform.id, account.id, "home")),
+          actionButton(text.dm, () => void openPlatform(platform.id, account.id, "messages")),
+        );
+      }
+      if (mine.length > 1 || account.bound) actions.append(actionButton(text.removeAccount, () => void removeAccount(account)));
+      box.append(actions);
+      if (account.lastError) box.append(el("div", "error ellipsis", account.lastError));
+      accountList.append(box);
     }
-    const meta = el("div");
-    meta.append(el("div", "name ellipsis", platform.name));
-    const who = account.bound ? account.nickname || platform.name : text.unbound;
-    const when = account.lastSyncAt ? clock(account.lastSyncAt) : "";
-    meta.append(el("div", "sub ellipsis", [who, when].filter(Boolean).join("  ")));
-    top.append(meta);
-    box.append(top);
-
-    const actions = el("div", "actions");
-    if (!account.bound) {
-      actions.append(
-        actionButton(text.bind, () => void openPlatform(platform.id, "home")),
-        actionButton(text.done, () => void confirm(platform.id, false)),
-        actionButton(text.force, () => void confirm(platform.id, true)),
-      );
-    } else {
-      actions.append(
-        actionButton(text.sync, () => void syncPlatform(platform.id), true),
-        actionButton(text.relogin, () => void openPlatform(platform.id, "home")),
-        actionButton(text.dm, () => void openPlatform(platform.id, "messages")),
-      );
-    }
-    box.append(actions);
-    if (account.lastError) box.append(el("div", "error ellipsis", account.lastError));
-    accountList.append(box);
+    const wrap = el("div", "actions");
+    wrap.append(actionButton(text.addAccount, () => void addAccount(platform.id)));
+    accountList.append(wrap);
   }
   const syncAllButton = actionButton(text.syncAll, () => void syncAll(), true);
   syncAllButton.classList.add("primary");
-  const wrap = el("div", "actions");
-  wrap.className = "actions sync-wrap";
-  wrap.append(syncAllButton);
-  accountList.append(wrap);
+  const syncWrap = el("div", "actions");
+  syncWrap.className = "actions sync-wrap";
+  syncWrap.append(syncAllButton);
+  accountList.append(syncWrap);
 }
 
 function actionButton(label: string, onClick: () => void, withSyncIcon = false): HTMLButtonElement {
@@ -989,23 +1349,92 @@ function renderFilters(): void {
     button.classList.toggle("active", button.dataset.filter === state.filter);
     button.disabled = state.busy;
   }
+  accountFilters.replaceChildren();
+  const pool = accountSlots().filter((account) => {
+    if (!account.bound) return false;
+    if (state.filter === "hidden") return false;
+    if (state.filter !== "all" && account.platform !== state.filter) return false;
+    return true;
+  });
+  accountFilters.hidden = pool.length < 2;
+  if (pool.length < 2) return;
+  const all = el("button", undefined, text.all);
+  all.type = "button";
+  all.classList.toggle("active", state.accountFilter === "");
+  all.disabled = state.busy;
+  all.addEventListener("click", () => {
+    state.accountFilter = "";
+    renderFilters();
+    renderAccounts();
+    renderList();
+  });
+  accountFilters.append(all);
+  for (const account of pool) {
+    const key = accountKey(account);
+    const button = el("button", undefined, chipLabel(account, pool));
+    button.type = "button";
+    button.classList.toggle("active", state.accountFilter === key);
+    button.disabled = state.busy;
+    button.addEventListener("click", () => {
+      state.accountFilter = state.accountFilter === key ? "" : key;
+      renderFilters();
+      renderAccounts();
+      renderList();
+    });
+    accountFilters.append(button);
+  }
 }
 
 function visibleConversations(): Conversation[] {
   return state.conversations.filter((item) => {
-    if (state.filter !== "all" && item.platform !== state.filter) return false;
+    const hidden = isHidden(item);
+    if (state.filter === "hidden") {
+      if (!hidden) return false;
+    } else if (hidden || (state.filter !== "all" && item.platform !== state.filter)) return false;
+    if (state.accountFilter) {
+      const split = state.accountFilter.indexOf(":");
+      const platform = state.accountFilter.slice(0, split);
+      const id = state.accountFilter.slice(split + 1);
+      if (item.platform !== platform || (item.accountId || "main") !== id) return false;
+    }
     if (!state.query) return true;
     return `${item.title} ${item.preview}`.toLowerCase().includes(state.query);
   });
 }
 
+function rowTool(name: "eye" | "eye-off" | "trash", label: string, onClick: () => void): HTMLButtonElement {
+  const button = el("button", "icon-button");
+  button.type = "button";
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.append(icon(name));
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    onClick();
+  });
+  return button;
+}
+
 function renderList(): void {
   const rows = visibleConversations();
   list.replaceChildren();
+  if (state.booting && !state.conversations.length) {
+    const box = el("div", "loading-state");
+    const head = el("div", "loading-head");
+    head.append(el("span", "spin"), el("span", undefined, text.loading));
+    box.append(head);
+    for (let index = 0; index < 6; index += 1) {
+      const row = el("div", "skeleton");
+      const lines = el("div", "skeleton-lines");
+      lines.append(el("div", "skeleton-line"), el("div", "skeleton-line short"));
+      row.append(el("div", "skeleton-avatar"), lines);
+      box.append(row);
+    }
+    list.append(box);
+    return;
+  }
   if (!rows.length) {
-    list.append(el("div", "sub", text.empty));
-    const empty = list.firstElementChild as HTMLElement;
-    empty.classList.add("empty-list");
+    list.append(el("div", "sub empty-list", state.filter === "hidden" ? text.hiddenEmpty : text.empty));
     return;
   }
   for (const item of rows) {
@@ -1028,9 +1457,15 @@ function renderList(): void {
     appendRich(preview, item.preview);
     body.append(titleRow, preview);
     button.append(body);
-    const side = el("div");
-    side.append(el("div", "time", item.time));
-    if (item.unread) side.append(el("div", "unread", String(item.unread)));
+    const side = el("div", "row-side");
+    const meta = el("div", "row-meta");
+    meta.append(el("div", "time", item.time));
+    if (item.unread) meta.append(el("div", "unread", String(item.unread)));
+    const actions = el("div", "row-actions");
+    const hidden = isHidden(item);
+    actions.append(rowTool(hidden ? "eye" : "eye-off", hidden ? text.unhide : text.hide, () => hidden ? unhideConversation(item) : hideConversation(item)));
+    actions.append(rowTool("trash", text.deleteChat, () => deleteConversation(item)));
+    side.append(meta, actions);
     button.append(side);
     button.addEventListener("click", () => void loadConversation(item));
     list.append(button);
@@ -1050,7 +1485,11 @@ function renderThread(stickToEnd = true): void {
   const title = el("div");
   title.append(el("div", "name ellipsis", item.title));
   if (state.threadWarning) title.append(el("div", "error ellipsis", state.threadWarning));
-  threadHead.append(tag, title);
+  const tools = el("div", "thread-tools");
+  const hidden = isHidden(item);
+  tools.append(rowTool(hidden ? "eye" : "eye-off", hidden ? text.unhide : text.hide, () => hidden ? unhideConversation(item) : hideConversation(item)));
+  tools.append(rowTool("trash", text.deleteChat, () => deleteConversation(item)));
+  threadHead.append(tag, title, tools);
   messages.replaceChildren();
   for (const message of state.messages) {
     const bubble = el("div", message.fromMe ? "bubble mine" : "bubble");
@@ -1079,24 +1518,24 @@ function renderThread(stickToEnd = true): void {
 
 async function syncBound(): Promise<void> {
   if (!state.accounts) return;
-  const bound = platforms.filter((item) => state.accounts?.[item.id].bound);
+  const bound = accountSlots().filter((account) => account.bound);
   if (!bound.length) return;
   await run(text.sync, async () => {
-    for (const platform of bound) await syncOne(platform.id, false);
+    for (const account of bound) await syncOne(account.platform, account.id, false);
   });
   await followConversationUpdates();
 }
 
 async function recoverLogins(): Promise<void> {
   if (!state.accounts) return;
-  for (const platform of platforms) {
-    if (state.accounts[platform.id].bound) continue;
+  for (const account of accountSlots()) {
+    if (account.bound) continue;
     try {
-      const accounts = await invoke<Accounts>("probe_login", { platform: platform.id });
-      const became = !state.accounts[platform.id].bound && accounts[platform.id].bound;
+      const accounts = await invoke<Accounts>("probe_login", { platform: account.platform, accountId: account.id });
+      const became = !findAccount(account.platform, account.id)?.bound && accounts.accounts.some((item) => item.platform === account.platform && item.id === account.id && item.bound);
       rememberAccounts(accounts);
       renderAccounts();
-      if (became) await syncOne(platform.id, false);
+      if (became) await syncOne(account.platform, account.id, false);
     } catch {
       continue;
     }
@@ -1109,6 +1548,10 @@ void refreshStatus()
   .then(() => syncBound())
   .catch((error) => {
     footer.textContent = errorText(error);
+  })
+  .finally(() => {
+    state.booting = false;
+    renderList();
   });
 
 window.setInterval(() => {

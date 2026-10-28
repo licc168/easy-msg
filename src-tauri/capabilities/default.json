@@ -2,14 +2,20 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "allow-session-status",
+    "allow-add-account",
+    "allow-remove-account",
     "allow-open-platform",
     "allow-confirm-login",
+    "allow-probe-login",
     "allow-sync-platform",
     "allow-load-thread",
-    "allow-send-message"
+    "allow-send-message",
+    "notification:default"
   ]
 }

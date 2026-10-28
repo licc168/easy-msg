@@ -75,6 +75,7 @@ function profileNickname(profile) {
     profile.getAttribute("aria-label") || "",
     profile.getAttribute("title") || "",
     image ? image.alt || "" : "",
+    profile.tagName === "IMG" ? profile.alt || "" : "",
   ].concat(linesOf(profile));
   return candidates.map((line) => String(line).replace(/\s+/g, " ").trim()).find((line) => line && line.length <= 32 && !navName(line) && !/^\d+$/.test(line)) || "";
 }
@@ -125,40 +126,472 @@ function scanPending() {
   });
 }
 
+function httpsUrl(value) {
+  const text = String(value || "").trim();
+  if (text.startsWith("https://")) return text;
+  if (text.startsWith("http://")) return "https://" + text.slice(7);
+  if (text.startsWith("//")) return "https:" + text;
+  return "";
+}
+
+function xhsSelf() {
+  return queryAll("a[href*='/user/profile'], a[href*='/user/self'], [data-e2e='user-info']").find((el) => {
+    if (!visible(el)) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width >= 16 && rect.height >= 16 && rect.width <= 280 && rect.height <= 140;
+  }) || null;
+}
+
+function digStoredUser(value, depth) {
+  if (!value || typeof value !== "object" || depth > 4) return null;
+  if (!Array.isArray(value)) {
+    const nickname = firstString(value, ["nickname", "nickName", "userName"]);
+    const avatar = httpsUrl(firstString(value, ["avatar", "image", "imageb", "images", "avatarUrl"]));
+    const id = firstString(value, ["userId", "user_id", "uid", "redId"]);
+    if (nickname && nickname.length <= 32 && !navName(nickname) && (id || avatar)) return { nickname, avatar };
+  }
+  const children = Array.isArray(value) ? value.slice(0, 6) : Object.keys(value).slice(0, 16).map((key) => value[key]);
+  for (const child of children) {
+    const found = digStoredUser(child, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function parseStored(raw) {
+  if (!raw || raw.length > 300000) return null;
+  try {
+    let value = JSON.parse(raw);
+    if (typeof value === "string" && value.length < 300000) {
+      try { value = JSON.parse(value); } catch (error) { /* already a string */ }
+    }
+    return value;
+  } catch (error) {
+    return null;
+  }
+}
+
+function directUser(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const nests = [value, value.user, value.userInfo, value.user_info, value.profile, value.data, value.account];
+  for (const item of nests) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const nickname = firstString(item, ["nickname", "nickName", "userName", "name"]);
+    const avatar = httpsUrl(firstString(item, ["avatar", "avatarUrl", "avatarUri", "avatar_url", "image", "imageb", "images"]));
+    const id = firstString(item, ["userId", "user_id", "uid", "secUid", "sec_uid", "redId", "red_id"]);
+    if (nickname && id && nickname.length <= 32 && !navName(nickname)) return { nickname, avatar };
+  }
+  return null;
+}
+
+function storageProfile() {
+  const bags = [localStorage, sessionStorage];
+  let fallback = null;
+  for (const bag of bags) {
+    let keys = [];
+    try { keys = Object.keys(bag); } catch (error) { continue; }
+    const ordered = keys.filter((key) => /self|current|profile|userinfo|user-info|user_info|loginuser|login-user/i.test(key))
+      .concat(keys.filter((key) => !/self|current|profile|userinfo|user-info|user_info|loginuser|login-user/i.test(key)));
+    for (const key of ordered) {
+      if (/conv|message|history|session-list|emoji/i.test(key)) continue;
+      let raw = "";
+      try { raw = bag.getItem(key) || ""; } catch (error) { continue; }
+      const found = directUser(parseStored(raw));
+      if (!found) continue;
+      if (/self|current|profile|userinfo|user-info|user_info|loginuser/i.test(key)) return found;
+      if (!fallback) fallback = found;
+    }
+  }
+  return fallback;
+}
+
+function railAvatar() {
+  const images = queryAll("img").filter((img) => {
+    if (!visible(img)) return false;
+    const rect = img.getBoundingClientRect();
+    if (rect.left > 88 || rect.top < 0 || rect.top > 760) return false;
+    if (rect.width < 24 || rect.height < 24 || rect.width > 72 || rect.height > 72) return false;
+    const src = httpsUrl(img.currentSrc || img.src);
+    return Boolean(src) && !/emoji|icon-login|logo|qrcode/i.test(src + " " + img.className);
+  });
+  const linked = images.find((img) => {
+    const host = img.closest ? img.closest("a") : null;
+    return host && /\/user\/|profile|self/i.test(host.getAttribute("href") || "");
+  });
+  if (linked) return linked;
+  const named = images.find((img) => /avatar/i.test(String(img.className || "") + " " + String(img.parentElement && img.parentElement.className || "")));
+  if (named) return named;
+  images.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+  return images[0] || null;
+}
+
+
+const identityCache = { host: "", at: 0, ttl: 0, value: null, debug: null };
+const xhsFetchCache = { id: "", at: 0, user: null, attempts: [] };
+
+function accountIdentity() {
+  const host = location.hostname;
+  const now = Date.now();
+  if (identityCache.value && identityCache.value.nickname && identityCache.host === host && now - identityCache.at < identityCache.ttl) {
+    return identityCache.value;
+  }
+  const onDouyin = host.indexOf("douyin") >= 0;
+  const onXhs = host.indexOf("xiaohongshu") >= 0;
+  const packed = onDouyin
+    ? readDouyinIdentity()
+    : (onXhs ? readXhsIdentity() : { value: storageProfile() || { nickname: "", avatar: "" }, debug: { source: "storage" } });
+  const value = {
+    nickname: (packed.value && packed.value.nickname) || "",
+    avatar: (packed.value && packed.value.avatar) || "",
+  };
+  identityCache.host = host;
+  identityCache.at = now;
+  identityCache.ttl = value.nickname ? 180000 : 20000;
+  identityCache.value = value;
+  identityCache.debug = packed.debug || null;
+  return value;
+}
+
+function storedBag(key) {
+  try {
+    return parseStored(localStorage.getItem(key) || "");
+  } catch (error) {
+    return null;
+  }
+}
+
+function readDouyinIdentity() {
+  let nickname = "";
+  let avatar = "";
+  const seen = [];
+  for (const key of ["user_info", "user_info_passport"]) {
+    const found = directUser(storedBag(key)) || digStoredUser(storedBag(key), 0);
+    seen.push(key + ":" + (found && found.nickname ? "yes" : "no"));
+    if (!found) continue;
+    if (!nickname && found.nickname && !navName(found.nickname)) nickname = found.nickname;
+    if (!avatar && found.avatar) avatar = found.avatar;
+  }
+  return {
+    value: { nickname, avatar },
+    debug: { source: "douyin-storage", seen, nickname, avatar: avatar.slice(0, 180) },
+  };
+}
+
+function imageUrl(img) {
+  if (!img) return "";
+  const values = [
+    img.getAttribute("src"),
+    img.getAttribute("data-src"),
+    img.getAttribute("data-origin"),
+    (img.getAttribute("srcset") || "").split(",")[0],
+    img.currentSrc,
+    img.src,
+  ];
+  for (const value of values) {
+    const url = httpsUrl(String(value || "").trim().split(/\s+/)[0]);
+    if (!url || /emoji|logo|qrcode|icon-login|picasso-static|fe-platform|fe-video/i.test(url)) continue;
+    return url;
+  }
+  return "";
+}
+
+function xhsSidebar() {
+  const images = queryAll("a[href*='/user/profile'] img").filter((img) => {
+    if (!visible(img)) return false;
+    const rect = img.getBoundingClientRect();
+    return rect.left < 160 && rect.width >= 16 && rect.width <= 80 && rect.height >= 16 && rect.height <= 80;
+  });
+  images.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+  const img = images.length ? images[images.length - 1] : null;
+  if (!img) return { id: "", avatar: "", src: "", currentSrc: "" };
+  const host = img.closest("a");
+  const href = host ? host.getAttribute("href") || "" : "";
+  const match = href.match(/\/user\/profile\/([A-Za-z0-9]+)/);
+  return {
+    id: match ? match[1] : "",
+    avatar: imageUrl(img),
+    src: String(img.getAttribute("src") || "").slice(0, 180),
+    currentSrc: String(img.currentSrc || img.src || "").slice(0, 180),
+  };
+}
+
+function pickUser(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+  const nickname = firstString(item, ["nickname", "nickName", "userName"]);
+  if (!nickname || nickname.length > 32 || navName(nickname)) return null;
+  const avatar = httpsUrl(firstString(item, ["imageb", "images", "image", "avatar", "avatarUrl"]));
+  const id = firstString(item, ["userId", "user_id", "redId", "red_id", "uid"]);
+  if (!id && !avatar) return null;
+  return { nickname, avatar };
+}
+
+function xhsUserFromState(state) {
+  if (!state || typeof state !== "object") return null;
+  const user = state.user && typeof state.user === "object" ? state.user : state;
+  const pools = [
+    user.userInfo,
+    user.basicInfo,
+    user.userPageData && user.userPageData.basicInfo,
+    user.data && user.data.basicInfo,
+    state.basicInfo,
+    state.data && state.data.basic_info,
+    state.data,
+  ];
+  for (const item of pools) {
+    const found = pickUser(item);
+    if (found) return found;
+  }
+  return null;
+}
+
+function pageUser() {
+  const bags = [];
+  try { if (window.__INITIAL_STATE__) bags.push(window.__INITIAL_STATE__); } catch (error) { /* ignore */ }
+  try { if (window.__INITIAL_SSR_STATE__) bags.push(window.__INITIAL_SSR_STATE__); } catch (error) { /* ignore */ }
+  try {
+    const el = document.querySelector("#app") || document.querySelector("#root");
+    const pinia = el && el.__vue_app__ && el.__vue_app__.config && el.__vue_app__.config.globalProperties && el.__vue_app__.config.globalProperties.$pinia;
+    const state = pinia && pinia.state && pinia.state.value;
+    if (state) {
+      for (const key of Object.keys(state)) bags.push(state[key]);
+    }
+  } catch (error) { /* ignore */ }
+  for (const bag of bags) {
+    const found = xhsUserFromState(bag);
+    if (found && found.nickname) return found;
+  }
+  return null;
+}
+
+function findIdUser(value, userId, depth) {
+  if (!value || typeof value !== "object" || depth > 6) return null;
+  if (!Array.isArray(value)) {
+    const id = firstString(value, ["userId", "user_id"]);
+    if (id === userId) {
+      const found = pickUser(value);
+      if (found) return found;
+    }
+  }
+  const children = Array.isArray(value) ? value.slice(0, 8) : Object.keys(value).slice(0, 24).map((key) => value[key]);
+  for (const child of children) {
+    const found = findIdUser(child, userId, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function fiberSelf(userId) {
+  if (!userId) return null;
+  const stack = [];
+  for (const doc of allDocs()) {
+    const root = doc.getElementById("root") || doc.getElementById("app") || doc.body;
+    if (!root) continue;
+    const key = Object.keys(root).find((item) => item.startsWith("__reactContainer$") || item.startsWith("__reactFiber$"));
+    if (key) stack.push(root[key]);
+  }
+  const seen = new Set();
+  let count = 0;
+  while (stack.length && count < 5000) {
+    const fiber = stack.pop();
+    if (!fiber || typeof fiber !== "object" || seen.has(fiber)) continue;
+    seen.add(fiber);
+    count += 1;
+    try {
+      const found = findIdUser(fiber.memoizedProps, userId, 0) || findIdUser(fiber.memoizedState, userId, 0);
+      if (found) return found;
+    } catch (error) { /* ignore */ }
+    if (fiber.child) stack.push(fiber.child);
+    if (fiber.sibling) stack.push(fiber.sibling);
+  }
+  return null;
+}
+
+function syncGet(url) {
+  try {
+    const xhr = new XMLHttpRequest();
+    xhr.open("GET", url, false);
+    xhr.withCredentials = true;
+    xhr.send(null);
+    return { status: xhr.status, url: xhr.responseURL || url, text: String(xhr.responseText || "") };
+  } catch (error) {
+    return { status: 0, url: url, text: "", error: String(error && error.message || error) };
+  }
+}
+
+function sliceObject(text, index) {
+  const start = text.indexOf("{", index);
+  if (start < 0 || start - index > 24) return "";
+  let depth = 0;
+  let quote = "";
+  let esc = false;
+  const endLimit = Math.min(text.length, start + 800000);
+  for (let i = start; i < endLimit; i += 1) {
+    const ch = text.charAt(i);
+    if (quote) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === "\"" || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return "";
+}
+
+function parseLoose(raw) {
+  if (!raw || raw.length > 800000) return null;
+  try {
+    let value = JSON.parse(raw);
+    if (typeof value === "string" && value.length < 800000) {
+      try { value = JSON.parse(value); } catch (error) { /* already a string */ }
+    }
+    return value;
+  } catch (error) {
+    return null;
+  }
+}
+
+function extractInitialState(html) {
+  const text = String(html || "");
+  const markers = ["window.__INITIAL_STATE__=", "window.__INITIAL_SSR_STATE__="];
+  for (const marker of markers) {
+    const start = text.indexOf(marker);
+    if (start < 0) continue;
+    const json = sliceObject(text, start + marker.length).replace(/\bundefined\b/g, "null");
+    const parsed = parseLoose(json);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function titleName(html) {
+  const match = String(html || "").match(/<title>([^<]{1,80})<\/title>/i);
+  if (!match) return "";
+  const title = match[1].replace(/\s+/g, " ").trim();
+  const name = title.split(/\s+-\s+/)[0].trim();
+  if (!name || name.length > 32 || navName(name) || name.indexOf("\u5c0f\u7ea2\u4e66") >= 0) return "";
+  return name;
+}
+
+function userFromResponse(text) {
+  if (!text) return null;
+  const parsed = parseLoose(text.trim());
+  if (parsed) {
+    const found = xhsUserFromState(parsed) || xhsUserFromState(parsed.data) || pickUser(parsed.data) || pickUser(parsed);
+    if (found) return found;
+  }
+  const state = extractInitialState(text);
+  return state ? xhsUserFromState(state) : null;
+}
+
+function fetchXhsUser(id) {
+  const urls = [
+    "https://www.xiaohongshu.com/user/profile/" + id,
+    "/api/sns/web/v2/user/me",
+    "/api/sns/web/v1/user/selfinfo",
+  ];
+  const attempts = [];
+  let found = null;
+  for (const url of urls) {
+    const response = syncGet(url);
+    const user = userFromResponse(response.text);
+    const nickname = (user && user.nickname) || titleName(response.text);
+    attempts.push({
+      url,
+      status: response.status,
+      final: String(response.url || "").slice(0, 140),
+      name: nickname || "",
+      error: response.error || "",
+    });
+    if (!found && nickname && !navName(nickname)) {
+      found = { nickname, avatar: (user && user.avatar) || "" };
+      break;
+    }
+  }
+  return { user: found, attempts };
+}
+
+function readXhsIdentity() {
+  const side = xhsSidebar();
+  const live = pageUser();
+  const fiber = live && live.nickname ? null : fiberSelf(side.id);
+  let remote = xhsFetchCache.user;
+  let attempts = xhsFetchCache.attempts;
+  const named = (live && live.nickname) || (fiber && fiber.nickname) || "";
+  const now = Date.now();
+  if (!named && side.id && (xhsFetchCache.id !== side.id || now - xhsFetchCache.at > 20000)) {
+    const fetched = fetchXhsUser(side.id);
+    remote = fetched.user;
+    attempts = fetched.attempts;
+    xhsFetchCache.id = side.id;
+    xhsFetchCache.at = now;
+    xhsFetchCache.user = remote;
+    xhsFetchCache.attempts = attempts;
+  }
+  const nickname = named || (remote && remote.nickname) || "";
+  const avatar = (live && live.avatar) || (fiber && fiber.avatar) || (remote && remote.avatar) || side.avatar || "";
+  return {
+    value: { nickname, avatar },
+    debug: {
+      source: "xhs",
+      id: side.id,
+      side: (side.avatar || "").slice(0, 180),
+      src: side.src,
+      currentSrc: side.currentSrc,
+      live,
+      fiber,
+      remote,
+      attempts,
+    },
+  };
+}
+
 function pageInfo() {
   const loginButton = exactVisible(["\u767b\u5f55", "\u626b\u7801\u767b\u5f55"]);
   const headerLogin = Boolean(loginButton && loginButton.getBoundingClientRect().top < 180);
-  const listed = queryAll("a[href*='/user/profile'], a[href*='/user/self'], [data-e2e='user-info']").find(visible) || null;
-  const profile = listed || headerUserLink();
+  const onXhs = location.hostname.indexOf("xiaohongshu") >= 0;
   const scanning = scanPending();
-  let storageUser = false;
-  try {
-    for (const key of Object.keys(localStorage)) {
-      if (!/user|profile|account/i.test(key)) continue;
-      const raw = localStorage.getItem(key) || "";
-      if (/"nickname"|"nickName"|"userId"|"uid"/.test(raw)) {
-        storageUser = true;
-        break;
+  const identity = accountIdentity();
+  let storageUser = Boolean(identity.nickname);
+  if (!storageUser) {
+    try {
+      for (const key of Object.keys(localStorage)) {
+        if (!/user|profile|account/i.test(key)) continue;
+        const raw = localStorage.getItem(key) || "";
+        if (/"nickname"|"nickName"|"userId"|"uid"/.test(raw)) {
+          storageUser = true;
+          break;
+        }
       }
+    } catch (error) {
+      storageUser = false;
     }
-  } catch (error) {
-    storageUser = false;
   }
   const cookie = document.cookie || "";
-  const hasSession = /(?:^|;\s*)(?:web_session|sessionid|sessionid_ss|sid_tt|uid_tt|uid_tt_ss|sid_guard|passport_assist_user|login_time)=/.test(cookie) || /(?:^|;\s*)LOGIN_STATUS=(?:1|true)/i.test(cookie);
-  const nickname = profileNickname(profile);
-  const image = profile ? profile.querySelector("img") : null;
-  const avatar = image && String(image.src || "").startsWith("https://") ? image.src : "";
-  const loggedIn = Boolean(profile || storageUser || (hasSession && (!scanning || /passport_assist_user|login_time|sessionid/.test(cookie))));
+  const xhsSession = /(?:^|;\s*)web_session=/.test(cookie);
+  const hasSession = xhsSession || /(?:^|;\s*)(?:sessionid|sessionid_ss|sid_tt|uid_tt|uid_tt_ss|sid_guard|passport_assist_user|login_time)=/.test(cookie) || /(?:^|;\s*)LOGIN_STATUS=(?:1|true)/i.test(cookie);
+  const loggedIn = onXhs
+    ? Boolean((xhsSession || identity.nickname) && !scanning && !headerLogin)
+    : Boolean(storageUser || identity.nickname || (hasSession && (!scanning || /passport_assist_user|login_time|sessionid/.test(cookie))));
   return {
     loggedIn,
     loginRequired: !loggedIn && (scanning || headerLogin),
-    nickname,
-    avatar,
+    nickname: identity.nickname || "",
+    avatar: identity.avatar || "",
     url: location.href,
     title: document.title || "",
   };
 }
+
+
 function heuristicRows() {
   const raw = queryAll("li,a,div").filter((el) => {
     if (!visible(el) || !el.querySelector("img") || inOpenThread(el)) return false;
@@ -243,7 +676,7 @@ function domConversations() {
     }
   }
   if (!nodes.length) nodes = heuristicRows();
-  const timePattern = /^(\d{1,2}:\d{2}|\u6628\u5929|\u524d\u5929|\u5468[\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u65e5]|\d+\u5206\u949f\u524d|\d+\u5c0f\u65f6\u524d|\d{1,2}-\d{1,2})$/;
+  const timePattern = /^(\d{1,2}:\d{2}|\u521a\u521a|\u6628\u5929|\u524d\u5929|\u5468[\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u65e5]|\d+\u5206\u949f\u524d|\d+\u5c0f\u65f6\u524d|\d{1,2}-\d{1,2}|\d{1,2}\/\d{1,2})$/;
   const items = [];
   const seen = new Set();
   nodes.forEach((element, index) => {
@@ -263,7 +696,7 @@ function domConversations() {
     }
     const image = element.querySelector("img");
     items.push({
-      id: title + "#" + index,
+      id: title,
       title,
       preview: preview.slice(0, 80),
       time,
@@ -407,7 +840,7 @@ function dedupe(items) {
     seen.add(key);
     result.push(item);
   }
-  return result.slice(0, 80);
+  return result.slice(0, 120);
 }
 
 function mergeConversations(domItems, fiberItems) {
@@ -448,22 +881,234 @@ function messageRegion() {
 }
 
 
-function scrollThreadToEnd() {
-  const region = messageRegion();
-  const targets = [];
-  if (region) targets.push(region);
-  for (const doc of allDocs()) {
-    if (doc.scrollingElement) targets.push(doc.scrollingElement);
-    targets.push(...doc.querySelectorAll("[class*=message], [class*=chat], [class*=msg]"));
-  }
-  for (const el of targets) {
-    try {
-      el.scrollTop = el.scrollHeight;
-    } catch (error) {
-      continue;
+function scrollable(el) {
+  if (!el) return null;
+  const nodes = [el, ...el.querySelectorAll("*")];
+  let best = null;
+  let bestExtra = 24;
+  for (const node of nodes) {
+    const extra = node.scrollHeight - node.clientHeight;
+    if (extra > bestExtra && node.clientHeight > 80) {
+      best = node;
+      bestExtra = extra;
     }
   }
+  if (best) return best;
+  let node = el.parentElement;
+  for (let depth = 0; node && depth < 6; depth += 1) {
+    if (node.scrollHeight > node.clientHeight + 24) return node;
+    node = node.parentElement;
+  }
+  return el;
+}
+
+function scrollList(direction) {
+  const list = queryAll("[class*='conversationConversationListwrapper'], [class*='ConversationList']").find((el) => {
+    const rect = el.getBoundingClientRect();
+    return rect.height > 200 && rect.width > 160 && rect.width < 560;
+  });
+  const el = list ? scrollable(list) : null;
+  if (!el) return { moved: false, atEnd: true };
+  const before = el.scrollTop;
+  if (direction === "top") el.scrollTop = 0;
+  else el.scrollTop = Math.min(el.scrollHeight, el.scrollTop + Math.max(220, el.clientHeight * 0.8));
+  return {
+    moved: Math.abs(el.scrollTop - before) > 2,
+    atEnd: el.scrollTop + el.clientHeight >= el.scrollHeight - 12,
+  };
+}
+
+function computedStyle(el) {
+  const view = el && el.ownerDocument && el.ownerDocument.defaultView;
+  return view ? view.getComputedStyle(el) : null;
+}
+
+function scrollableStyle(style) {
+  if (!style) return false;
+  return style.overflowY === "auto" || style.overflowY === "scroll" || style.overflowY === "overlay";
+}
+
+function messageListBox() {
+  const named = queryAll("[class*='messageMessageListlist'], [class*='messageList'], [class*='MessageList']").filter((el) => {
+    const rect = el.getBoundingClientRect();
+    return visible(el) && rect.width > 280 && rect.height > 160;
+  });
+  named.sort((a, b) => {
+    const an = String(a.className || "").includes("messageMessageListlist") ? 0 : 1;
+    const bn = String(b.className || "").includes("messageMessageListlist") ? 0 : 1;
+    if (an !== bn) return an - bn;
+    const ar = a.getBoundingClientRect();
+    const br = b.getBoundingClientRect();
+    return br.width * br.height - ar.width * ar.height;
+  });
+  return named[0] || messageRegion();
+}
+
+function scrollerCandidates(seed) {
+  const found = [];
+  const listRect = seed ? seed.getBoundingClientRect() : null;
+  const push = (el) => {
+    if (!el || found.includes(el)) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 180 || rect.height < 80) return;
+    if (listRect) {
+      const x = rect.left + rect.width / 2;
+      const y = rect.top + rect.height / 2;
+      if (x < listRect.left - 24 || x > listRect.right + 24 || y < listRect.top - 48 || y > listRect.bottom + 48) return;
+    }
+    found.push(el);
+  };
+  if (!seed) return found;
+  push(seed);
+  for (const child of seed.querySelectorAll("*")) push(child);
+  let parent = seed.parentElement;
+  for (let depth = 0; parent && depth < 5; depth += 1) {
+    push(parent);
+    parent = parent.parentElement;
+  }
+  return found;
+}
+
+function scoreScroller(el) {
+  const style = computedStyle(el);
+  const extra = el.scrollHeight - el.clientHeight;
+  const reversed = style && (style.flexDirection === "column-reverse" || style.flexDirection === "row-reverse");
+  let score = 0;
+  if (scrollableStyle(style)) score += 120;
+  if (reversed) score += 40;
+  if (extra > 20) score += Math.min(extra, 1600) / 10;
+  if (String(el.className || "").includes("messageMessageListlist")) score += 90;
+  if (el.clientHeight > 200) score += 15;
+  return score;
+}
+
+function scrollerInfo(el) {
+  const style = computedStyle(el);
+  const reversed = Boolean(style && (style.flexDirection === "column-reverse" || style.flexDirection === "row-reverse"));
+  const rect = el.getBoundingClientRect();
+  return {
+    style,
+    reversed,
+    minTop: Math.min(0, el.clientHeight - el.scrollHeight),
+    maxTop: Math.max(0, el.scrollHeight - el.clientHeight),
+    x: rect.left + Math.min(Math.max(rect.width * 0.62, 48), Math.max(rect.width - 20, 48)),
+    y: rect.top + rect.height * 0.42,
+  };
+}
+
+function applyScroll(el, top) {
+  const previous = el.style.scrollBehavior;
+  el.style.scrollBehavior = "auto";
+  try {
+    el.scrollTop = top;
+    el.scrollTo(0, top);
+  } catch (error) {
+    el.scrollTop = top;
+  }
+  el.style.scrollBehavior = previous;
+}
+
+function scrollOne(el, direction) {
+  const info = scrollerInfo(el);
+  const before = el.scrollTop;
+  const step = Math.max(320, el.clientHeight * 0.92);
+  let target = before;
+  if (direction === "end") target = info.reversed ? 0 : info.maxTop;
+  else if (info.reversed) target = direction === "down" ? Math.min(0, before + step) : Math.max(info.minTop, before - step);
+  else if (direction === "down") target = Math.min(info.maxTop, before + step);
+  else target = Math.max(info.minTop, before - step);
+  applyScroll(el, target);
+  if (!info.reversed && direction !== "down" && direction !== "end" && Math.abs(el.scrollTop - before) <= 2) {
+    applyScroll(el, before - step);
+  }
+  wheelOn(el, direction === "down" ? 720 : -720);
+  const top = el.scrollTop;
+  return {
+    found: true,
+    moved: Math.abs(top - before) > 2,
+    atTop: info.reversed ? top <= info.minTop + 4 : top <= 4,
+    top: Math.round(top),
+    height: Math.round(el.scrollHeight),
+    client: Math.round(el.clientHeight),
+    reversed: info.reversed || top < -2,
+    overflow: info.style ? info.style.overflowY : "",
+    flex: info.style ? info.style.flexDirection : "",
+    x: Math.round(info.x),
+    y: Math.round(info.y),
+    className: String(el.className || "").slice(0, 80),
+  };
+}
+
+function messageScroller() {
+  const seed = messageListBox();
+  const ranked = scrollerCandidates(seed).sort((a, b) => scoreScroller(b) - scoreScroller(a));
+  return ranked[0] || seed || null;
+}
+
+function scrollMessages(direction) {
+  const seed = messageListBox();
+  const ranked = scrollerCandidates(seed).sort((a, b) => scoreScroller(b) - scoreScroller(a));
+  const ordered = [];
+  if (seed) ordered.push(seed);
+  for (const el of ranked) {
+    if (!ordered.includes(el)) ordered.push(el);
+  }
+  if (!ordered.length) return { found: false, moved: false, atTop: true };
+  let fallback = null;
+  for (const el of ordered.slice(0, 8)) {
+    const attempt = scrollOne(el, direction);
+    if (!fallback) fallback = attempt;
+    if (attempt.moved) return attempt;
+  }
+  return fallback;
+}
+
+function scrollThreadToEnd() {
+  const el = messageScroller();
+  if (!el) return { scrolled: false };
+  scrollOne(el, "end");
   return { scrolled: true };
+}
+
+function historyNudge() {
+  const el = messageListBox() || messageScroller();
+  const button = controlByLabel(["\u67e5\u770b\u66f4\u591a", "\u52a0\u8f7d\u66f4\u591a", "\u66f4\u591a\u6d88\u606f", "\u67e5\u770b\u5386\u53f2\u6d88\u606f", "\u5386\u53f2\u6d88\u606f"]);
+  if (button) fireClick(button);
+  const called = [];
+  if (!el) return { found: false, clicked: Boolean(button), called };
+  const interesting = /loadmore|loadprev|loadhistory|fetchmore|reachtop|scrolltoupper|onscroll|onwheel/i;
+  const fiberKey = Object.keys(el).find((item) => item.startsWith("__reactFiber$") || item.startsWith("__reactInternalInstance$"));
+  let fiber = fiberKey ? el[fiberKey] : null;
+  const seen = new Set();
+  for (let step = 0; fiber && step < 5; step += 1) {
+    if (seen.has(fiber)) break;
+    seen.add(fiber);
+    const bags = [fiber.memoizedProps, fiber.pendingProps, fiber.stateNode];
+    for (const bag of bags) {
+      if (!bag || typeof bag !== "object" || bag.nodeType) continue;
+      for (const name of Object.keys(bag)) {
+        if (typeof bag[name] !== "function" || called.includes(name) || !interesting.test(name)) continue;
+        if (step > 0 && /^onscroll$|^onwheel$/i.test(name)) continue;
+        try {
+          bag[name]({
+            deltaY: -560,
+            deltaX: 0,
+            target: el,
+            currentTarget: el,
+            preventDefault() {},
+            stopPropagation() {},
+            persist() {},
+            nativeEvent: { deltaY: -560 },
+          });
+          called.push(name);
+        } catch (error) {
+          called.push(name + "!");
+        }
+      }
+    }
+    fiber = fiber.return;
+  }
+  return { found: true, clicked: Boolean(button), called: called.slice(0, 8) };
 }
 
 function messageTextOf(el) {
@@ -582,6 +1227,7 @@ function domMessages() {
     right = Math.max(right, item.rect.right);
   }
   const regionRect = right > left ? { left, right } : { left: 0, right: window.innerWidth };
+  if (location.hostname.indexOf("douyin") >= 0) prepared.reverse();
   const messages = [];
   const seen = new Set();
   for (const item of prepared) {
@@ -591,7 +1237,7 @@ function domMessages() {
     const fromMe = fromMeMessage(item.box, item.rect, regionRect);
     messages.push({ id: messages.length + "-" + item.text.slice(0, 12), text: item.text.slice(0, 2000), fromMe, time: item.time, image: item.image || "" });
   }
-  return messages.slice(-40);
+  return messages.slice(-80);
 }
 
 function fireClick(el) {
@@ -615,14 +1261,36 @@ function fireClick(el) {
   el.click();
 }
 
+function douyinLabel(row) {
+  const nodes = [...row.querySelectorAll("[class*='conversationConversationItemtitle']")];
+  const titles = nodes.filter((el) => {
+    const name = String(el.className || "");
+    return name.includes("conversationConversationItemtitle") && !name.includes("Wrapper") && !name.includes("Tag");
+  });
+  const source = titles.length ? titles : nodes;
+  let best = "";
+  for (const el of source) {
+    const label = ((el.innerText || "").split("\n").map((line) => line.trim()).find(Boolean) || "").replace(/\s+/g, " ");
+    if (label && (!best || label.length < best.length)) best = label;
+  }
+  return best;
+}
+
+function douyinRow(title) {
+  const wanted = String(title || "").replace(/\s+/g, " ").trim();
+  if (!wanted) return null;
+  const rows = queryAll("[class*='conversationConversationItemwrapper']").filter((el) => douyinLabel(el) === wanted);
+  rows.sort((a, b) => {
+    const ar = a.getBoundingClientRect();
+    const br = b.getBoundingClientRect();
+    return ar.width * ar.height - br.width * br.height;
+  });
+  return rows[0] || null;
+}
+
 function openDouyinConversation(title) {
   if (!title || location.hostname.indexOf("douyin") < 0) return false;
-  const rows = queryAll("[class*='conversationConversationItemwrapper']").filter((el) => {
-    const name = el.querySelector("[class*='conversationConversationItemtitle']");
-    const label = name ? (name.innerText || "").replace(/\s+/g, " ").trim() : "";
-    return label === title;
-  });
-  const row = rows.sort((a, b) => a.getBoundingClientRect().width * a.getBoundingClientRect().height - b.getBoundingClientRect().width * b.getBoundingClientRect().height)[0];
+  const row = douyinRow(title);
   if (!row) return false;
   fireClick(row);
   return true;
@@ -1350,13 +2018,7 @@ function run(action) {
     return { conversations: conversations.map(publicConversation), nudged, page: pageInfo() };
   }
   if (action.type === "douyin-row") {
-    const title = String(action.title || "");
-    const rows = queryAll("[class*='conversationConversationItemwrapper']").filter((el) => {
-      const name = el.querySelector("[class*='conversationConversationItemtitle']");
-      const label = name ? (name.innerText || "").replace(/\s+/g, " ").trim() : "";
-      return label === title;
-    });
-    const row = rows[0];
+    const row = douyinRow(String(action.title || ""));
     if (!row) return { found: false };
     const rect = row.getBoundingClientRect();
     return { found: true, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
@@ -1380,6 +2042,10 @@ function run(action) {
     const opened = openXhsConversation(title) || openDouyinConversation(title) || openConversation(String(action.id || ""), title);
     return { opened: opened, page: pageInfo() };
   }
+  if (action.type === "scroll-list") return scrollList(String(action.direction || "down"));
+  if (action.type === "scroll-messages") return scrollMessages(String(action.direction || "up"));
+  if (action.type === "history-nudge") return historyNudge();
+  if (action.type === "conversations") return { conversations: domConversations().map(publicConversation) };
   if (action.type === "scroll-end") return scrollThreadToEnd();
   if (action.type === "messages") {
     const dom = domMessages();

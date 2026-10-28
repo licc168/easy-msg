@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-probe-login"
+description = "Enables the probe_login command without any pre-configured scope."
+commands.allow = ["probe_login"]
+
+[[permission]]
+identifier = "deny-probe-login"
+description = "Denies the probe_login command without any pre-configured scope."
+commands.deny = ["probe_login"]
